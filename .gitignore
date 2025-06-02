@@ -30,3 +30,10 @@
 *.exe
 *.out
 *.app
+
+# VS Code workspace files
+.vscode/
+
+# CMake build & install directories
+bin/
+build/
