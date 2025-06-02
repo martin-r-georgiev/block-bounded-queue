@@ -162,7 +162,7 @@ public:
         // Allocate and initialize blocks.
         blocks_ = new Block[block_num];
         for (size_t i = 0; i < block_num; ++i)
-            blocks_[i].init(block_size);
+            blocks_[i].init(this, block_size, i == 0);
     }
 
     /// @brief Destroys the Block Bounded Queue object, releasing all allocated resources.
@@ -186,7 +186,7 @@ public:
                 commit_entry(entry, data);
                 return Status::OK;
             case State::BLOCK_DONE:
-                switch (advance_phead())
+                switch (advance_phead(ph))
                 {
                     case State::NO_ENTRY:
                         return Status::FULL;
@@ -224,19 +224,15 @@ public:
                     return {opt_data.value(), Status::OK};
                 else
                     goto loop;
-                break;
             case State::NO_ENTRY:
                 return {std::nullopt, Status::EMPTY};
-                break;
             case State::NOT_AVAILABLE:
                 return {std::nullopt, Status::BUSY};
-                break;
             case State::BLOCK_DONE:
-                if (advance_chead(entry.version))
+                if (advance_chead(ch, entry.version))
                     goto loop;
                 else
                     return {std::nullopt, Status::EMPTY};
-                break;
             default:
                 std::fprintf(stderr, "Unexpected state in dequeue: %d\n", static_cast<int>(state));
                 return {std::nullopt, Status::BUSY}; // Fallback status
@@ -253,7 +249,19 @@ private:
 
         ~Block() { delete[] entries; }
 
-        void init(const std::size_t num_entries) { entries = new T[num_entries]; }
+        void init(const BlockBoundedQueue* parent, const std::size_t num_entries, bool is_first)
+        {
+            entries = new T[num_entries];
+
+            // If not the first block, set the cursors' offset to the block size.
+            if (!is_first)
+            {
+                allocated.store(parent->pkg_cursor(num_entries, 0), std::memory_order_relaxed);
+                committed.store(parent->pkg_cursor(num_entries, 0), std::memory_order_relaxed);
+                reserved.store(parent->pkg_cursor(num_entries, 0), std::memory_order_relaxed);
+                consumed.store(parent->pkg_cursor(num_entries, 0), std::memory_order_relaxed);
+            }
+        }
 
         alignas(CACHELINE_SIZE) T* entries;
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> allocated;
@@ -362,8 +370,11 @@ private:
     template<typename U, typename = std::enable_if_t<std::is_integral_v<U> || std::is_floating_point_v<U>>>
     U atomic_max(std::atomic<U>& var, const int new_val)
     {
-        U old_val = var.load();
-        while (old_val < new_val && !var.compare_exchange_weak(old_val, new_val)) {}
+        U old_val = var.load(std::memory_order_relaxed);
+        while (old_val < new_val &&
+               !var.compare_exchange_weak(old_val, new_val, std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+        }
         return old_val;
     }
 
@@ -395,13 +406,13 @@ private:
     void commit_entry(EntryDesc& entry, T data)
     {
         entry.block->entries[entry.offset] = data;
-        entry.block->committed++;
+        entry.block->committed.fetch_add(1, std::memory_order_relaxed);
     }
 
-    State advance_phead()
+    State advance_phead(std::size_t ph)
     {
-        const std::size_t nblk_idx = (block_idx(ph_) + 1) % block_num_;
-        const std::size_t nblk_vsn = block_vsn(ph_) + (nblk_idx == 0 ? 1 : 0);
+        const std::size_t nblk_idx = (block_idx(ph) + 1) % block_num_;
+        const std::size_t nblk_vsn = block_vsn(ph) + (nblk_idx == 0 ? 1 : 0);
         Block* nblk = &blocks_[nblk_idx];
 
         if constexpr (mode == QueueMode::RETRY_NEW)
@@ -409,8 +420,8 @@ private:
             // In retry-new mode, we can only advance the P.Head to the next block
             // if the next block is fully consumed.
             std::size_t consumed = nblk->consumed.load(std::memory_order_acquire);
-            if (cursor_vsn(consumed) < block_vsn(ph_) ||
-                (cursor_vsn(consumed) == block_vsn(ph_) && cursor_off(consumed) < block_size_))
+            if (cursor_vsn(consumed) < block_vsn(ph) ||
+                (cursor_vsn(consumed) == block_vsn(ph) && cursor_off(consumed) != block_size_))
             {
                 std::size_t reserved = nblk->reserved.load(std::memory_order_acquire);
                 return (cursor_off(reserved) == cursor_off(consumed)) ? State::NO_ENTRY : State::NOT_AVAILABLE;
@@ -421,12 +432,12 @@ private:
             // In drop-old mode, we can always advance the P.Head to the next block
             // as long as the next block is fully committed.
             std::size_t committed = nblk->committed.load(std::memory_order_acquire);
-            if (cursor_vsn(committed) == block_vsn(ph_) && cursor_off(committed) < block_size_)
+            if (cursor_vsn(committed) == block_vsn(ph) && cursor_off(committed) < block_size_)
                 return State::NOT_AVAILABLE;
         }
 
-        atomic_max(nblk->committed, pkg_cursor(0, block_vsn(ph_) + 1));
-        atomic_max(nblk->allocated, pkg_cursor(0, block_vsn(ph_) + 1));
+        atomic_max(nblk->committed, pkg_cursor(0, block_vsn(ph) + 1));
+        atomic_max(nblk->allocated, pkg_cursor(0, block_vsn(ph) + 1));
         atomic_max(ph_, pkg_head(nblk_idx, nblk_vsn));
 
         return State::SUCCESS;
@@ -467,7 +478,7 @@ private:
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
-            entry.block->consumed++;
+            entry.block->consumed.fetch_add(1, std::memory_order_relaxed);
         }
         else
         {
@@ -479,25 +490,25 @@ private:
         return data;
     }
 
-    bool advance_chead(std::size_t version)
+    bool advance_chead(std::size_t ch, std::size_t version)
     {
-        const std::size_t nblk_idx = (block_idx(ch_) + 1) % block_num_;
-        const std::size_t nblk_vsn = block_vsn(ch_) + (nblk_idx == 0 ? 1 : 0);
+        const std::size_t nblk_idx = (block_idx(ch) + 1) % block_num_;
+        const std::size_t nblk_vsn = block_vsn(ch) + (nblk_idx == 0 ? 1 : 0);
         Block* nblk = &blocks_[nblk_idx];
 
         std::size_t committed = nblk->committed.load(std::memory_order_acquire);
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
-            if (cursor_vsn(committed) != block_vsn(ch_) + 1)
+            if (cursor_vsn(committed) != block_vsn(ch) + 1)
                 return false;
 
-            atomic_max(nblk->consumed, pkg_cursor(0, block_vsn(ch_) + 1));
-            atomic_max(nblk->reserved, pkg_cursor(0, block_vsn(ch_) + 1));
+            atomic_max(nblk->consumed, pkg_cursor(0, block_vsn(ch) + 1));
+            atomic_max(nblk->reserved, pkg_cursor(0, block_vsn(ch) + 1));
         }
         else
         {
-            if (cursor_vsn(committed) < version + (block_idx(ch_) == 0))
+            if (cursor_vsn(committed) < version + (block_idx(ch) == 0))
                 return false;
 
             atomic_max(nblk->reserved, pkg_cursor(0, cursor_vsn(committed)));
