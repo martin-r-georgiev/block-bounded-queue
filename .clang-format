@@ -1,0 +1,39 @@
+# Project coding style .clang-format file
+# https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+
+---
+Language: Cpp
+AlignAfterOpenBracket: Align			# Align parameters after open bracket
+AlignEscapedNewlines: Left				# Align escaped newlines as far left as possible
+AllowShortBlocksOnASingleLine: Always	# Allow short blocks on a single line
+AlignConsecutiveMacros: true			# Align consecutive macros
+DerivePointerAlignment: false
+IndentPPDirectives: BeforeHash
+BreakConstructorInitializers: BeforeComma
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+
+# Templates
+SpacesInAngles: Never					# Never put spaces in template argument lists
+SpaceAfterTemplateKeyword: false		# No space after template keyword
+AlwaysBreakTemplateDeclarations: Yes	# Always break after template declarations
+
+# Switch statements
+IndentCaseLabels: true					# Indent switch case labels
+IndentCaseBlocks: false					# Don't indent case blocks (they already are due to label indentation)
+
+# Lambdas
+LambdaBodyIndentation: Signature
+AllowShortLambdasOnASingleLine: All
+
+AllowShortFunctionsOnASingleLine: InlineOnly
+PointerAlignment: Left
+BreakBeforeBraces: Allman
+IndentAccessModifiers: false
+AccessModifierOffset: -4
+ReflowComments: true
+RemoveBracesLLVM: true
