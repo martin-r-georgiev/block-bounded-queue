@@ -88,10 +88,34 @@
 
 // TODO: Consider removing copy/move constructors to avoid implicit copying of blocks/entry descriptors.
 // TODO: Compare performance with/without the cache line alignments.
-// TODO: Move status enum outside of the class to avoid the template instantiation bloat.
+
+#if defined(__GNUC__) || defined(__clang__)
+    #define BBQ_LIKELY(x)   __builtin_expect(!!(x), 1)
+    #define BBQ_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+    #define BBQ_LIKELY(x)   (x)
+    #define BBQ_UNLIKELY(x) (x)
+#endif
 
 namespace queues
 {
+
+/// @brief Enum class that defines the possible queue operation OpStatus codes.
+enum class OpStatus : uint8_t
+{
+    /// @brief The operation was successful.
+    OK = 0,
+
+    /// @brief The queue is full, and the enqueue operation cannot proceed.
+    FULL = 1,
+
+    /// @brief The queue is empty, and the dequeue operation cannot proceed.
+    EMPTY = 2,
+
+    /// @brief The queue is busy, and the operation cannot proceed due to
+    /// another ongoing operation (e.g., another enqueue or dequeue).
+    BUSY = 3,
+};
 
 /// @brief Enum class to define the queue's operation mode.
 enum class QueueMode : uint8_t
@@ -120,23 +144,6 @@ template<typename T, QueueMode mode = QueueMode::RETRY_NEW>
 class BlockBoundedQueue
 {
 public:
-    /// @brief Enum class that defines the possible queue operation status codes.
-    enum class Status : uint8_t
-    {
-        /// @brief The operation was successful.
-        OK = 0,
-
-        /// @brief The queue is full, and the enqueue operation cannot proceed.
-        FULL = 1,
-
-        /// @brief The queue is empty, and the dequeue operation cannot proceed.
-        EMPTY = 2,
-
-        /// @brief The queue is busy, and the operation cannot proceed due to
-        /// another ongoing operation (e.g., another enqueue or dequeue).
-        BUSY = 3,
-    };
-
     /**
      * @brief Constructs a BlockBoundedQueue with the specified number of blocks
      * and block size.
@@ -172,9 +179,9 @@ public:
      * @brief Enqueues an element into the queue.
      *
      * @param data The data to be enqueued.
-     * @return Status The result of the enqueue operation.
+     * @return OpOpStatus The result of the enqueue operation.
      */
-    Status enqueue(const T& data)
+    OpStatus enqueue(const T& data)
     {
     loop:
         auto [ph, blk] = get_phead_and_block();
@@ -184,23 +191,23 @@ public:
             case State::ALLOCATED:
                 // Successfully allocated an entry.
                 commit_entry(entry, data);
-                return Status::OK;
+                return OpStatus::OK;
             case State::BLOCK_DONE:
                 switch (advance_phead(ph))
                 {
                     case State::NO_ENTRY:
-                        return Status::FULL;
+                        return OpStatus::FULL;
                     case State::NOT_AVAILABLE:
-                        return Status::BUSY;
+                        return OpStatus::BUSY;
                     case State::SUCCESS:
                         goto loop;
                     default:
                         std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
-                        return Status::BUSY; // Fallback status
+                        return OpStatus::BUSY; // Fallback OpStatus
                 }
             default:
                 std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
-                return Status::BUSY; // Fallback status
+                return OpStatus::BUSY; // Fallback OpStatus
         }
     }
 
@@ -208,9 +215,9 @@ public:
      * @brief Dequeues an element from the queue.
      *
      * @return A pair containing an optional T (the dequeued value if successful, otherwise std::nullopt)
-     * and the dequeue status.
+     * and the dequeue OpStatus.
      */
-    const std::pair<std::optional<T>, Status> dequeue()
+    const std::pair<std::optional<T>, OpStatus> dequeue()
     {
     loop:
         auto [ch, blk] = get_chead_and_block();
@@ -221,21 +228,21 @@ public:
             case State::RESERVED:
                 opt_data = consume_entry(entry);
                 if (opt_data.has_value())
-                    return {opt_data.value(), Status::OK};
+                    return {opt_data.value(), OpStatus::OK};
                 else
                     goto loop;
             case State::NO_ENTRY:
-                return {std::nullopt, Status::EMPTY};
+                return {std::nullopt, OpStatus::EMPTY};
             case State::NOT_AVAILABLE:
-                return {std::nullopt, Status::BUSY};
+                return {std::nullopt, OpStatus::BUSY};
             case State::BLOCK_DONE:
                 if (advance_chead(ch, entry.version))
                     goto loop;
                 else
-                    return {std::nullopt, Status::EMPTY};
+                    return {std::nullopt, OpStatus::EMPTY};
             default:
                 std::fprintf(stderr, "Unexpected state in dequeue: %d\n", static_cast<int>(state));
-                return {std::nullopt, Status::BUSY}; // Fallback status
+                return {std::nullopt, OpStatus::BUSY}; // Fallback OpStatus
         }
     }
 
@@ -332,18 +339,18 @@ private:
     /// @brief Gets the index from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The block index the head points to.
-    inline std::size_t block_idx(const std::size_t h_val) const { return h_val & idx_mask_; }
+    inline std::size_t block_idx(const std::size_t h_val) const noexcept { return h_val & idx_mask_; }
 
     /// @brief Gets the version from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The version of the block the head points to.
-    inline std::size_t block_vsn(const std::size_t h_val) const { return (h_val >> idx_bits_) & vsn_mask_; }
+    inline std::size_t block_vsn(const std::size_t h_val) const noexcept { return (h_val >> idx_bits_) & vsn_mask_; }
 
     /// @brief Packs the segment index and version back into a single value.
     /// @param idx The index of the the head.
     /// @param vsn The version of the the head.
     /// @return The packed value containing the index and version.
-    inline std::size_t pkg_head(std::size_t idx, std::size_t vsn) const
+    inline std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
     {
         return (idx & idx_mask_) | ((vsn << idx_bits_) & (vsn_mask_ << idx_bits_));
     }
@@ -352,17 +359,17 @@ private:
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
     /// @return The offset of the entry in the block.
-    inline std::size_t cursor_off(const std::size_t c_val) const { return c_val & off_mask_; }
+    inline std::size_t cursor_off(const std::size_t c_val) const noexcept { return c_val & off_mask_; }
 
     /// @brief Gets the version from the block cursor value
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
-    inline std::size_t cursor_vsn(const std::size_t c_val) const { return (c_val >> off_bits_) & vsn_mask_; }
+    inline std::size_t cursor_vsn(const std::size_t c_val) const noexcept { return (c_val >> off_bits_) & vsn_mask_; }
 
     /// @brief Packs the segment offset and version back into a single value.
     /// @param off The offset of the cursor in the block.
     /// @param vsn The version of the cursor in the block.
-    inline std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const
+    inline std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
     {
         return (off & off_mask_) | ((vsn << off_bits_) & (vsn_mask_ << off_bits_));
     }
@@ -371,6 +378,9 @@ private:
     U atomic_max(std::atomic<U>& var, const int new_val)
     {
         U old_val = var.load(std::memory_order_relaxed);
+        if (old_val >= new_val)
+            return old_val;
+
         while (old_val < new_val &&
                !var.compare_exchange_weak(old_val, new_val, std::memory_order_relaxed, std::memory_order_relaxed))
         {
@@ -393,11 +403,11 @@ private:
     const std::pair<State, EntryDesc> allocate_entry(Block* blk)
     {
         std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
-        if (cursor_off(allocated) >= block_size_)
+        if (BBQ_UNLIKELY(cursor_off(allocated) >= block_size_))
             return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
 
         std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_relaxed);
-        if (cursor_off(old_cursor) >= block_size_)
+        if (BBQ_UNLIKELY(cursor_off(old_cursor) >= block_size_))
             return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
 
         return std::make_pair(State::ALLOCATED, EntryDesc(blk, cursor_off(old_cursor)));
@@ -405,7 +415,7 @@ private:
 
     void commit_entry(EntryDesc& entry, T data)
     {
-        entry.block->entries[entry.offset] = data;
+        entry.block->entries[entry.offset] = std::move(data);
         entry.block->committed.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -447,7 +457,7 @@ private:
     {
     again:
         std::size_t reserved = blk->reserved.load(std::memory_order_relaxed);
-        if (cursor_off(reserved) < block_size_)
+        if (BBQ_LIKELY(cursor_off(reserved) < block_size_))
         {
             // Check if all committed entries have already been reserved for consumption.
             std::size_t committed = blk->committed.load(std::memory_order_relaxed);
@@ -474,7 +484,7 @@ private:
 
     [[nodiscard]] std::optional<T> consume_entry(EntryDesc& entry)
     {
-        T data = entry.block->entries[entry.offset];
+        T data = std::move(entry.block->entries[entry.offset]);
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {

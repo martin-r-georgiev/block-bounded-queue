@@ -11,17 +11,17 @@
 #include <unordered_set>
 #include <vector>
 
-std::string status_to_string(queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status status)
+std::string status_to_string(queues::OpStatus status)
 {
     switch (status)
     {
-        case queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::OK:
+        case queues::OpStatus::OK:
             return "OK";
-        case queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::FULL:
+        case queues::OpStatus::FULL:
             return "FULL";
-        case queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::EMPTY:
+        case queues::OpStatus::EMPTY:
             return "EMPTY";
-        case queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::BUSY:
+        case queues::OpStatus::BUSY:
             return "BUSY";
         default:
             return "UNKNOWN";
@@ -29,12 +29,12 @@ std::string status_to_string(queues::BlockBoundedQueue<int, queues::QueueMode::R
 }
 
 constexpr uint8_t NUM_PRODUCERS = 4;
-constexpr uint8_t NUM_CONSUMERS = 4;
-constexpr uint32_t ITEMS_PER_PRODUCER = 25000;
+constexpr uint8_t NUM_CONSUMERS = 1;
+constexpr uint32_t ITEMS_PER_PRODUCER = 2500000;
 
 int main()
 {
-    queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW> queue(4, 128);
+    queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW> queue(8, 10000);
     std::vector<std::thread> producers;
     std::vector<std::thread> consumers;
     std::atomic<uint32_t> enq_item_count = 0;
@@ -54,8 +54,7 @@ int main()
                 for (uint32_t j = 0; j < ITEMS_PER_PRODUCER; j++)
                 {
                     uint32_t item_val = (i * ITEMS_PER_PRODUCER) + j;
-                    while (queue.enqueue(item_val) !=
-                           queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::OK)
+                    while (queue.enqueue(item_val) != queues::OpStatus::OK)
                         std::this_thread::yield();
 
                     enq_item_count.fetch_add(1, std::memory_order_relaxed);
@@ -73,7 +72,7 @@ int main()
                 while (deq_item_count.load(std::memory_order_acquire) < expected_item_count)
                 {
                     auto [data, status] = queue.dequeue();
-                    if (status == queues::BlockBoundedQueue<int, queues::QueueMode::RETRY_NEW>::Status::OK)
+                    if (status == queues::OpStatus::OK)
                     {
                         if (!data.has_value())
                         {
