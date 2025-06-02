@@ -89,14 +89,6 @@
 // TODO: Consider removing copy/move constructors to avoid implicit copying of blocks/entry descriptors.
 // TODO: Compare performance with/without the cache line alignments.
 
-#if defined(__GNUC__) || defined(__clang__)
-    #define BBQ_LIKELY(x)   __builtin_expect(!!(x), 1)
-    #define BBQ_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-    #define BBQ_LIKELY(x)   (x)
-    #define BBQ_UNLIKELY(x) (x)
-#endif
-
 namespace queues
 {
 
@@ -403,11 +395,11 @@ private:
     const std::pair<State, EntryDesc> allocate_entry(Block* blk)
     {
         std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
-        if (BBQ_UNLIKELY(cursor_off(allocated) >= block_size_))
+        if (cursor_off(allocated) >= block_size_) [[unlikely]]
             return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
 
         std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_relaxed);
-        if (BBQ_UNLIKELY(cursor_off(old_cursor) >= block_size_))
+        if (cursor_off(old_cursor) >= block_size_) [[unlikely]]
             return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
 
         return std::make_pair(State::ALLOCATED, EntryDesc(blk, cursor_off(old_cursor)));
@@ -442,7 +434,7 @@ private:
             // In drop-old mode, we can always advance the P.Head to the next block
             // as long as the next block is fully committed.
             std::size_t committed = nblk->committed.load(std::memory_order_acquire);
-            if (cursor_vsn(committed) == block_vsn(ph) && cursor_off(committed) < block_size_)
+            if (cursor_vsn(committed) == block_vsn(ph) && cursor_off(committed) < block_size_) [[unlikely]]
                 return State::NOT_AVAILABLE;
         }
 
@@ -457,7 +449,7 @@ private:
     {
     again:
         std::size_t reserved = blk->reserved.load(std::memory_order_relaxed);
-        if (BBQ_LIKELY(cursor_off(reserved) < block_size_))
+        if (cursor_off(reserved) < block_size_) [[likely]]
         {
             // Check if all committed entries have already been reserved for consumption.
             std::size_t committed = blk->committed.load(std::memory_order_relaxed);
@@ -493,7 +485,7 @@ private:
         else
         {
             std::size_t allocated = entry.block->allocated.load(std::memory_order_acquire);
-            if (cursor_vsn(allocated) != entry.version)
+            if (cursor_vsn(allocated) != entry.version) [[unlikely]]
                 return std::nullopt;
         }
 
