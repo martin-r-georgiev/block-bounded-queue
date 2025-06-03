@@ -177,7 +177,8 @@ public:
     {
     loop:
         auto [ph, blk] = get_phead_and_block();
-        auto [state, entry] = allocate_entry(blk);
+        EntryDesc entry(blk);
+        State state = allocate_entry(blk, entry);
         switch (state)
         {
             case State::ALLOCATED:
@@ -213,7 +214,8 @@ public:
     {
     loop:
         auto [ch, blk] = get_chead_and_block();
-        auto [state, entry] = reserve_entry(blk);
+        EntryDesc entry(blk);
+        State state = reserve_entry(blk, entry);
         std::optional<T> opt_data;
         switch (state)
         {
@@ -392,17 +394,18 @@ private:
         return {ch_val, blocks_ + block_idx(ch_val)};
     }
 
-    const std::pair<State, EntryDesc> allocate_entry(Block* blk)
+    const State allocate_entry(Block* blk, EntryDesc& entry) noexcept
     {
         std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
         if (cursor_off(allocated) >= block_size_) [[unlikely]]
-            return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
+            return State::BLOCK_DONE;
 
         std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_relaxed);
         if (cursor_off(old_cursor) >= block_size_) [[unlikely]]
-            return std::make_pair(State::BLOCK_DONE, EntryDesc(nullptr, 0, 0));
+            return State::BLOCK_DONE;
 
-        return std::make_pair(State::ALLOCATED, EntryDesc(blk, cursor_off(old_cursor)));
+        entry.offset = cursor_off(old_cursor);
+        return State::ALLOCATED;
     }
 
     inline void commit_entry(EntryDesc& entry, T data) noexcept
@@ -445,7 +448,7 @@ private:
         return State::SUCCESS;
     }
 
-    std::pair<State, EntryDesc> reserve_entry(Block* blk)
+    State reserve_entry(Block* blk, EntryDesc& entry)
     {
     again:
         std::size_t reserved = blk->reserved.load(std::memory_order_relaxed);
@@ -454,7 +457,7 @@ private:
             // Check if all committed entries have already been reserved for consumption.
             std::size_t committed = blk->committed.load(std::memory_order_relaxed);
             if (cursor_off(reserved) == cursor_off(committed))
-                return std::make_pair(State::NO_ENTRY, EntryDesc(nullptr, 0, 0));
+                return State::NO_ENTRY;
 
             // If the committed cursor is not at the end of the block,
             // check if there are any pending allocation operations.
@@ -462,16 +465,21 @@ private:
             {
                 std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
                 if (cursor_off(allocated) != cursor_off(committed))
-                    return std::make_pair(State::NOT_AVAILABLE, EntryDesc(nullptr, 0, 0));
+                    return State::NOT_AVAILABLE;
             }
 
             if (atomic_max(blk->reserved, pkg_cursor(cursor_off(reserved) + 1, cursor_vsn(reserved))) == reserved)
-                return std::make_pair(State::RESERVED, EntryDesc(blk, cursor_off(reserved), cursor_vsn(reserved)));
+            {
+                entry.offset = cursor_off(reserved);
+                entry.version = cursor_vsn(reserved);
+                return State::RESERVED;
+            }
             else
                 goto again; // Retry if the reservation failed.
         }
 
-        return std::make_pair(State::BLOCK_DONE, EntryDesc(blk, cursor_vsn(reserved)));
+        entry.version = cursor_vsn(reserved);
+        return State::BLOCK_DONE;
     }
 
     [[nodiscard]] std::optional<T> consume_entry(EntryDesc& entry)
