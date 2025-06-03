@@ -262,7 +262,7 @@ private:
             }
         }
 
-        alignas(CACHELINE_SIZE) T* entries;
+        T* entries;
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> allocated;
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> committed;
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> reserved;
@@ -310,8 +310,8 @@ private:
         NOT_AVAILABLE = 5,
     };
 
-    std::size_t block_num_;
-    std::size_t block_size_;
+    const std::size_t block_num_;
+    const std::size_t block_size_;
     const uint8_t idx_bits_;
     const uint8_t off_bits_;
     const uint8_t vsn_bits_;
@@ -320,7 +320,7 @@ private:
     const std::size_t vsn_mask_;
 
     /// @brief The internal queue block array.
-    alignas(CACHELINE_SIZE) Block* blocks_;
+    Block* blocks_;
 
     /// @brief The queue-level producer head (P.Head).
     alignas(CACHELINE_SIZE) std::atomic<std::size_t> ph_;
@@ -367,7 +367,7 @@ private:
     }
 
     template<typename U, typename = std::enable_if_t<std::is_integral_v<U> || std::is_floating_point_v<U>>>
-    U atomic_max(std::atomic<U>& var, const int new_val)
+    U atomic_max(std::atomic<U>& var, const U new_val) noexcept
     {
         U old_val = var.load(std::memory_order_relaxed);
         if (old_val >= new_val)
@@ -380,16 +380,16 @@ private:
         return old_val;
     }
 
-    const std::pair<std::size_t, Block*> get_phead_and_block() const
+    inline const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
         std::size_t ph_val = ph_.load(std::memory_order_relaxed);
-        return {ph_val, &blocks_[block_idx(ph_val)]};
+        return {ph_val, blocks_ + block_idx(ph_val)};
     }
 
-    const std::pair<std::size_t, Block*> get_chead_and_block() const
+    inline const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
         std::size_t ch_val = ch_.load(std::memory_order_relaxed);
-        return {ch_val, &blocks_[block_idx(ch_val)]};
+        return {ch_val, blocks_ + block_idx(ch_val)};
     }
 
     const std::pair<State, EntryDesc> allocate_entry(Block* blk)
@@ -405,7 +405,7 @@ private:
         return std::make_pair(State::ALLOCATED, EntryDesc(blk, cursor_off(old_cursor)));
     }
 
-    void commit_entry(EntryDesc& entry, T data)
+    inline void commit_entry(EntryDesc& entry, T data) noexcept
     {
         entry.block->entries[entry.offset] = std::move(data);
         entry.block->committed.fetch_add(1, std::memory_order_relaxed);
@@ -415,7 +415,7 @@ private:
     {
         const std::size_t nblk_idx = (block_idx(ph) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ph) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = &blocks_[nblk_idx];
+        Block* nblk = blocks_ + nblk_idx;
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
@@ -496,7 +496,7 @@ private:
     {
         const std::size_t nblk_idx = (block_idx(ch) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ch) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = &blocks_[nblk_idx];
+        Block* nblk = blocks_ + nblk_idx;
 
         std::size_t committed = nblk->committed.load(std::memory_order_acquire);
 
