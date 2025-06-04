@@ -314,9 +314,9 @@ private:
 
     const std::size_t block_num_;
     const std::size_t block_size_;
-    const uint8_t idx_bits_;
-    const uint8_t off_bits_;
-    const uint8_t vsn_bits_;
+    const uint32_t idx_bits_;
+    const uint32_t off_bits_;
+    const uint32_t vsn_bits_;
     const std::size_t idx_mask_;
     const std::size_t off_mask_;
     const std::size_t vsn_mask_;
@@ -371,12 +371,12 @@ private:
     template<typename U, typename = std::enable_if_t<std::is_integral_v<U> || std::is_floating_point_v<U>>>
     U atomic_max(std::atomic<U>& var, const U new_val) noexcept
     {
-        U old_val = var.load(std::memory_order_relaxed);
+        U old_val = var.load(std::memory_order_acquire);
         if (old_val >= new_val)
             return old_val;
 
         while (old_val < new_val &&
-               !var.compare_exchange_weak(old_val, new_val, std::memory_order_relaxed, std::memory_order_relaxed))
+               !var.compare_exchange_weak(old_val, new_val, std::memory_order_acq_rel, std::memory_order_acquire))
         {
         }
         return old_val;
@@ -384,23 +384,23 @@ private:
 
     inline const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
-        std::size_t ph_val = ph_.load(std::memory_order_relaxed);
+        std::size_t ph_val = ph_.load(std::memory_order_acquire);
         return {ph_val, blocks_ + block_idx(ph_val)};
     }
 
     inline const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
-        std::size_t ch_val = ch_.load(std::memory_order_relaxed);
+        std::size_t ch_val = ch_.load(std::memory_order_acquire);
         return {ch_val, blocks_ + block_idx(ch_val)};
     }
 
     const State allocate_entry(Block* blk, EntryDesc& entry) noexcept
     {
-        std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
+        std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
         if (cursor_off(allocated) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
-        std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_relaxed);
+        std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_acq_rel);
         if (cursor_off(old_cursor) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
@@ -411,7 +411,7 @@ private:
     inline void commit_entry(EntryDesc& entry, T data) noexcept
     {
         entry.block->entries[entry.offset] = std::move(data);
-        entry.block->committed.fetch_add(1, std::memory_order_relaxed);
+        entry.block->committed.fetch_add(1, std::memory_order_release);
     }
 
     State advance_phead(std::size_t ph)
@@ -451,11 +451,11 @@ private:
     State reserve_entry(Block* blk, EntryDesc& entry)
     {
     again:
-        std::size_t reserved = blk->reserved.load(std::memory_order_relaxed);
+        std::size_t reserved = blk->reserved.load(std::memory_order_acquire);
         if (cursor_off(reserved) < block_size_) [[likely]]
         {
             // Check if all committed entries have already been reserved for consumption.
-            std::size_t committed = blk->committed.load(std::memory_order_relaxed);
+            std::size_t committed = blk->committed.load(std::memory_order_acquire);
             if (cursor_off(reserved) == cursor_off(committed))
                 return State::NO_ENTRY;
 
@@ -463,7 +463,7 @@ private:
             // check if there are any pending allocation operations.
             if (cursor_off(committed) != block_size_)
             {
-                std::size_t allocated = blk->allocated.load(std::memory_order_relaxed);
+                std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
                 if (cursor_off(allocated) != cursor_off(committed))
                     return State::NOT_AVAILABLE;
             }
@@ -488,7 +488,7 @@ private:
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
-            entry.block->consumed.fetch_add(1, std::memory_order_relaxed);
+            entry.block->consumed.fetch_add(1, std::memory_order_release);
         }
         else
         {
