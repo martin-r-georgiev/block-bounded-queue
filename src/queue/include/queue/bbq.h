@@ -86,8 +86,15 @@
 //   - Source:
 //   https://stackoverflow.com/questions/2127310/c-c-bitfields-versus-bitwise-operators-to-single-out-bits-which-is-faster-be
 
-// TODO: Consider removing copy/move constructors to avoid implicit copying of blocks/entry descriptors.
-// TODO: Compare performance with/without the cache line alignments.
+#ifndef ATTR_ALWAYS_INLINE
+    #if defined(__GNUC__) || defined(__clang__)
+        #define ATTR_ALWAYS_INLINE inline __attribute__((always_inline))
+    #elif defined(_MSC_VER)
+        #define ATTR_ALWAYS_INLINE __forceinline
+    #else
+        #define ATTR_ALWAYS_INLINE inline
+    #endif
+#endif
 
 namespace queues
 {
@@ -171,7 +178,7 @@ public:
      * @brief Enqueues an element into the queue.
      *
      * @param data The data to be enqueued.
-     * @return OpOpStatus The result of the enqueue operation.
+     * @return OpStatus The result of the enqueue operation.
      */
     OpStatus enqueue(const T& data)
     {
@@ -241,7 +248,7 @@ public:
     }
 
 private:
-    inline static constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
+    static constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
     /// @brief The block abstraction used in the queue to split the queue's entries.
     struct Block
@@ -333,18 +340,21 @@ private:
     /// @brief Gets the index from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The block index the head points to.
-    inline std::size_t block_idx(const std::size_t h_val) const noexcept { return h_val & idx_mask_; }
+    ATTR_ALWAYS_INLINE std::size_t block_idx(const std::size_t h_val) const noexcept { return h_val & idx_mask_; }
 
     /// @brief Gets the version from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The version of the block the head points to.
-    inline std::size_t block_vsn(const std::size_t h_val) const noexcept { return (h_val >> idx_bits_) & vsn_mask_; }
+    ATTR_ALWAYS_INLINE std::size_t block_vsn(const std::size_t h_val) const noexcept
+    {
+        return (h_val >> idx_bits_) & vsn_mask_;
+    }
 
     /// @brief Packs the segment index and version back into a single value.
     /// @param idx The index of the the head.
     /// @param vsn The version of the the head.
     /// @return The packed value containing the index and version.
-    inline std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
     {
         return (idx & idx_mask_) | ((vsn << idx_bits_) & (vsn_mask_ << idx_bits_));
     }
@@ -353,17 +363,20 @@ private:
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
     /// @return The offset of the entry in the block.
-    inline std::size_t cursor_off(const std::size_t c_val) const noexcept { return c_val & off_mask_; }
+    ATTR_ALWAYS_INLINE std::size_t cursor_off(const std::size_t c_val) const noexcept { return c_val & off_mask_; }
 
     /// @brief Gets the version from the block cursor value
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
-    inline std::size_t cursor_vsn(const std::size_t c_val) const noexcept { return (c_val >> off_bits_) & vsn_mask_; }
+    ATTR_ALWAYS_INLINE std::size_t cursor_vsn(const std::size_t c_val) const noexcept
+    {
+        return (c_val >> off_bits_) & vsn_mask_;
+    }
 
     /// @brief Packs the segment offset and version back into a single value.
     /// @param off The offset of the cursor in the block.
     /// @param vsn The version of the cursor in the block.
-    inline std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
     {
         return (off & off_mask_) | ((vsn << off_bits_) & (vsn_mask_ << off_bits_));
     }
@@ -382,13 +395,13 @@ private:
         return old_val;
     }
 
-    inline const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
+    ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
         std::size_t ph_val = ph_.load(std::memory_order_acquire);
         return {ph_val, blocks_ + block_idx(ph_val)};
     }
 
-    inline const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
+    ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
         std::size_t ch_val = ch_.load(std::memory_order_acquire);
         return {ch_val, blocks_ + block_idx(ch_val)};
@@ -408,7 +421,7 @@ private:
         return State::ALLOCATED;
     }
 
-    inline void commit_entry(EntryDesc& entry, T data) noexcept
+    ATTR_ALWAYS_INLINE void commit_entry(EntryDesc& entry, T data) noexcept
     {
         entry.block->entries[entry.offset] = std::move(data);
         entry.block->committed.fetch_add(1, std::memory_order_release);
