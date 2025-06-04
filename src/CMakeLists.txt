@@ -7,6 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-fdiagnostics-all-candidates)
+add_compile_options(-Wno-interference-size)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "[Debug] Disabling inlining and frame pointer omission for profiling")
+    
+    add_compile_options(-fno-inline)
+    add_compile_options(-fno-omit-frame-pointer)
+endif()
+
 
 get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
