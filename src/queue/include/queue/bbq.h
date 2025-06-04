@@ -75,6 +75,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <type_traits>
 
@@ -154,17 +155,17 @@ public:
         , idx_mask_((idx_bits_ < 64) ? ((1ULL << idx_bits_) - 1) : ~0ULL)
         , off_mask_((off_bits_ < 64) ? ((1ULL << off_bits_) - 1) : ~0ULL)
         , vsn_mask_((vsn_bits_ < 64) ? ((1ULL << vsn_bits_) - 1) : ~0ULL)
+        , blocks_(std::make_unique<Block[]>(block_num))
     {
         assert(block_num > 0 && block_size > 0 && "Block number and size must be greater than 0.");
 
         // Allocate and initialize blocks.
-        blocks_ = new Block[block_num];
         for (size_t i = 0; i < block_num; ++i)
             blocks_[i].init(this, block_size, i == 0);
     }
 
     /// @brief Destroys the Block Bounded Queue object, releasing all allocated resources.
-    ~BlockBoundedQueue() { delete[] blocks_; }
+    ~BlockBoundedQueue() = default;
 
     /**
      * @brief Enqueues an element into the queue.
@@ -197,9 +198,9 @@ public:
                         std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
                         return OpStatus::BUSY; // Fallback OpStatus
                 }
-            default:
+            [[unlikely]] default:
                 std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
-                return OpStatus::BUSY; // Fallback OpStatus
+                return OpStatus::BUSY; // Fallback status
         }
     }
 
@@ -233,9 +234,9 @@ public:
                     goto loop;
                 else
                     return {std::nullopt, OpStatus::EMPTY};
-            default:
+            [[unlikely]] default:
                 std::fprintf(stderr, "Unexpected state in dequeue: %d\n", static_cast<int>(state));
-                return {std::nullopt, OpStatus::BUSY}; // Fallback OpStatus
+                return {std::nullopt, OpStatus::BUSY}; // Fallback status
         }
     }
 
@@ -247,11 +248,9 @@ private:
     {
         Block() : entries(nullptr), allocated(0), committed(0), reserved(0), consumed(0) {}
 
-        ~Block() { delete[] entries; }
-
         void init(const BlockBoundedQueue* parent, const std::size_t num_entries, bool is_first)
         {
-            entries = new T[num_entries];
+            entries = std::make_unique<T[]>(num_entries);
 
             // If not the first block, set the cursors' offset to the block size.
             if (!is_first)
@@ -262,8 +261,6 @@ private:
                 consumed.store(parent->pkg_cursor(num_entries, 0), std::memory_order_relaxed);
             }
         }
-
-        T* entries;
 
         /// @brief A producer cursor pointing to the last entry in the block allocated for writing.
         /// @remark If the allocated and committed cursors point to different entries in the block,
@@ -280,6 +277,8 @@ private:
 
         /// @brief A consumer cursor pointing to the last entry in the block that has been consumed.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> consumed;
+
+        std::unique_ptr<T[]> entries;
     };
 
     /// @brief A metadata structure that describes an entry in the queue.
@@ -349,7 +348,7 @@ private:
     const std::size_t vsn_mask_;
 
     /// @brief The internal queue block array.
-    Block* blocks_;
+    std::unique_ptr<Block[]> blocks_;
 
     /// @brief The queue-level producer head (P.Head).
     alignas(CACHELINE_SIZE) std::atomic<std::size_t> ph_;
@@ -360,12 +359,15 @@ private:
     /// @brief Gets the index from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The block index the head points to.
-    ATTR_ALWAYS_INLINE std::size_t block_idx(const std::size_t h_val) const noexcept { return h_val & idx_mask_; }
+    ATTR_ALWAYS_INLINE constexpr std::size_t block_idx(const std::size_t h_val) const noexcept
+    {
+        return h_val & idx_mask_;
+    }
 
     /// @brief Gets the version from the queue-level head value (P.Head or C.Head).
     /// @param h_val The loaded atomic value of the head.
     /// @return The version of the block the head points to.
-    ATTR_ALWAYS_INLINE std::size_t block_vsn(const std::size_t h_val) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t block_vsn(const std::size_t h_val) const noexcept
     {
         return (h_val >> idx_bits_) & vsn_mask_;
     }
@@ -374,7 +376,7 @@ private:
     /// @param idx The index of the the head.
     /// @param vsn The version of the the head.
     /// @return The packed value containing the index and version.
-    ATTR_ALWAYS_INLINE std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
     {
         return (idx & idx_mask_) | ((vsn << idx_bits_) & (vsn_mask_ << idx_bits_));
     }
@@ -383,12 +385,15 @@ private:
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
     /// @return The offset of the entry in the block.
-    ATTR_ALWAYS_INLINE std::size_t cursor_off(const std::size_t c_val) const noexcept { return c_val & off_mask_; }
+    ATTR_ALWAYS_INLINE constexpr std::size_t cursor_off(const std::size_t c_val) const noexcept
+    {
+        return c_val & off_mask_;
+    }
 
     /// @brief Gets the version from the block cursor value
     /// (i.e., allocated, committed, reserved, or consumed).
     /// @param c_val The loaded atomic value of the cursor.
-    ATTR_ALWAYS_INLINE std::size_t cursor_vsn(const std::size_t c_val) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t cursor_vsn(const std::size_t c_val) const noexcept
     {
         return (c_val >> off_bits_) & vsn_mask_;
     }
@@ -396,7 +401,7 @@ private:
     /// @brief Packs the segment offset and version back into a single value.
     /// @param off The offset of the cursor in the block.
     /// @param vsn The version of the cursor in the block.
-    ATTR_ALWAYS_INLINE std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
     {
         return (off & off_mask_) | ((vsn << off_bits_) & (vsn_mask_ << off_bits_));
     }
@@ -408,7 +413,7 @@ private:
     /// @param new_val The new value to compare and potentially set as the maximum.
     /// @return The old value of the atomic variable before the operation.
     template<typename U, typename = std::enable_if_t<std::is_integral_v<U> || std::is_floating_point_v<U>>>
-    U atomic_max(std::atomic<U>& var, const U new_val) noexcept
+    static U atomic_max(std::atomic<U>& var, const U new_val) noexcept
     {
         U old_val = var.load(std::memory_order_acquire);
         if (old_val >= new_val)
@@ -424,13 +429,23 @@ private:
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
         std::size_t ph_val = ph_.load(std::memory_order_acquire);
-        return {ph_val, blocks_ + block_idx(ph_val)};
+        Block* blk = blocks_.get() + block_idx(ph_val);
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(blk, 0, 2);
+#endif
+
+        return {ph_val, blk};
     }
 
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
         std::size_t ch_val = ch_.load(std::memory_order_acquire);
-        return {ch_val, blocks_ + block_idx(ch_val)};
+        Block* blk = blocks_.get() + block_idx(ch_val);
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(blk, 0, 2);
+#endif
+
+        return {ch_val, blk};
     }
 
     const State allocate_entry(Block* blk, EntryDesc& entry) noexcept
@@ -453,11 +468,11 @@ private:
         entry.block->committed.fetch_add(1, std::memory_order_release);
     }
 
-    State advance_phead(std::size_t ph)
+    State advance_phead(std::size_t ph) noexcept
     {
         const std::size_t nblk_idx = (block_idx(ph) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ph) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = blocks_ + nblk_idx;
+        Block* nblk = blocks_.get() + nblk_idx;
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
@@ -487,7 +502,7 @@ private:
         return State::SUCCESS;
     }
 
-    State reserve_entry(Block* blk, EntryDesc& entry)
+    State reserve_entry(Block* blk, EntryDesc& entry) noexcept
     {
     again:
         std::size_t reserved = blk->reserved.load(std::memory_order_acquire);
@@ -522,7 +537,7 @@ private:
         return State::BLOCK_DONE;
     }
 
-    [[nodiscard]] std::optional<T> consume_entry(EntryDesc& entry)
+    [[nodiscard]] std::optional<T> consume_entry(EntryDesc& entry) noexcept
     {
         T data = std::move(entry.block->entries[entry.offset]);
 
@@ -545,11 +560,11 @@ private:
         return data;
     }
 
-    bool advance_chead(std::size_t ch, std::size_t version)
+    bool advance_chead(std::size_t ch, std::size_t version) noexcept
     {
         const std::size_t nblk_idx = (block_idx(ch) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ch) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = blocks_ + nblk_idx;
+        Block* nblk = blocks_.get() + nblk_idx;
 
         std::size_t committed = nblk->committed.load(std::memory_order_acquire);
 
