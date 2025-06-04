@@ -1,90 +1,82 @@
 #pragma once
 
+/*
+ * bbq.h - Lock-free block-based bounded queue (BBQ)
+ *
+ * This file contains a C++ implementation of the
+ * Block-based Bounded Queue (BBQ) algorithm as described in:
+ *
+ *   "BBQ: A Block-based Bounded Queue for Exchanging Data and Profiling"
+ *   Jiawei Wang et al., USENIX ATC 2022
+ *   https://www.usenix.org/conference/atc22/presentation/wang-jiawei
+ *
+ * This implementation provides a lock-free, fixed-size queue that splits
+ * the internal data structure into blocks, operated using queue- and block-level
+ * control variables. The implementation supports single and multiple producer-consumer
+ * scenarios. Furthermore, it can operate in two modes: RETRY_NEW and DROP_OLD.
+ * For in-depth details on the algorithm, please refer to the paper.
+ * Additional design considerations and implementation notes are provided below.
+ *
+ * Credits:
+ *   Algorithm & Design: Wang et al. (2022)
+ *   Implementation: Martin Georgiev <martin.r.georgiev@hotmail.com>
+ *
+ * Copyright (c) 2025 Martin Georgiev
+ * Licensed under the MIT License.
+ */
+
+/*
+ * Notes:
+ * - This implementation was done first and foremost for educational purposes.
+ *   As a result, the code is extensively commented to explain the algorithm
+ *   and its design.
+ * - The queue-level control variables (C.Head and P.Head) contain two
+ *   bit segments: index and version.
+ *   - The index points to the block the producer(s) and consumer(s)
+ *     are currently processing (or last processed).
+ *   - The version identifies how many times the internal data structure
+ *     in the queue has been reused. Used to avoid the ABA problem.
+ * - The block-level control variables (allocated, committed, reserved, consumed)
+ *   contain two bit segments: offset and version.
+ *   - The offset points to the entry in the block producer(s) and consumer(s)
+ *     are currently processing (or last processed).
+ *   - The version identifies how many times the block has been reused.
+ *     Used to avoid the ABA problem.
+ * - The algorithm design allows for overflows to the block-level cursors
+ *   (i.e., the offset exceeds the block size).
+ * - The first block's version starts at 0; all other blocks start at 1.
+ *   The off-by-one version offset difference is constant across the queue's lifetime.
+ */
+
+/*
+ * Design Considerations:
+ * - Constructor parameters are used instead of template parameters to allow for
+ *   the initialization of a queue, which size is only known at runtime.
+ *   - Consequently, internal data structures can only be allocated on the heap,
+ *     which may lead to some performance degradation due to increased likelihood
+ *     of cache misses.
+ * - The queue does not support resizing. The responsibility is offset to the user,
+ *   who would need to copy the contents of the old queue to a newly created one.
+ * - The control variables are stored as 64-bit integers, with its bit segments
+ *   accessible using bitwise operations. I opted to use bitwise operations
+ *   instead of bit fields or bitsets to allow for greater portability and
+ *   flexibility. Bit fields are implementation-defined and may not operate as expected
+ *   across different compilers or platforms. Performance-wise, bitwise operations
+ *   are comparable to bit fields.
+ *
+ *   Refs:
+ *   - https://en.cppreference.com/w/cpp/language/bit_field
+ *   - https://en.cppreference.com/w/cpp/language/bitset
+ *   - https://stackoverflow.com/q/2127310
+ */
+
 #include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <new>
 #include <optional>
-#include <stdexcept>
 #include <type_traits>
-
-// Queue-level control variables
-// - C.Head (points to a block in the queue)
-// - P.Head (points to a block in the queue)
-// - The queue-level control variables contain an index pointing to a block and
-// a version identifying how many times the whole queue has been reused.
-
-// Block-level control variables (cursors)
-// - allocated (producer cursor)
-// - committed (producer cursor)
-// - reserved (consumer cursor)
-// - consumed (consumer cursor)
-// - The block-level control variables contain an offset field pointing to an
-// entry in the block and a version field identifying how many times the block
-// has been reused.
-
-// Notes:
-// - Producers start using a block only after it has been fully consumed.
-// - Enqueue operation is supposed to use FAA (Fetch-And-Add).
-// - Dequeue operation is supposed to use CAS (Compare-And-Swap) to avoid
-// consumers from invalidating entries currently used by producers.
-// - Enqueue steps:
-//   1. Retrieve current value of P.Head and the corresponding block identifier.
-//   2. An allocation is attempted on the block.
-//   2a. If it succeeds, the producer writes the data into the allocated entry
-//   and commits it.
-//   3. If it fails, then it means that the block is full, so the producer will
-//   try to advance the P.Head to the next block. 3a. If it succeeds, the
-//   producer loops back to step 1. 3b. In retry-new mode, advancing P.Head will
-//   fail if the next block is not fully consumed.
-//   - The algorithm distinguishes between failures: It is either returns FULL
-//   or BUSY if some dequeue operation is ongoing. 3c. In drop-old mode,
-//   advancing P.Head will not fail except for a seldom case, for which BUSY is
-//   returned.
-// - Dequeue steps:
-//   1. Retrieves the current value of C.Head and the corresponding block
-//   identifier.
-//   2. It attempts to reserve an entry in the block to consume, advancing the
-//   reserved cursor. 2a. If it succeeds, the consumer reads the data from the
-//   reserved entry and advances the consumed cursor. 2b. In drop-old mode, the
-//   consumer may have to retry consuming if the producers have overwritten the
-//   block, going back to step 1. 2c. Reserving an entry can fail in several
-//   ways:
-//      - When the next entry in blk is allocated but not yet commited, dequeue
-//      will return BUSY.
-//      - When blk is not fully allocated and all commited entries were already
-//      consumed, dequeue will return EMPTY.
-//   3. When blk is fully commited and fully consumed, the consumer tries to
-//   advance C.Head to the next block. 3a. If it succeds, it retries to reserve
-//   an entry, jumping back to step 1. 3b. If it fails, it returns EMPTY,
-//   indicating that all entries in the queue have been consumed.
-// - Control variables are versioned to identify multiple reuses of the same
-// memory locations and avoid the ABA problem.
-
-// Design considerations:
-// - Constructor parameters are used instead of template parameters so that the
-//   queue can be dynamically resized.
-//   - While the ready queue size for Lingua Franca's C++ runtime is fixed, the
-//     reactions and event queues do not have a fixed size. Since these
-//     parameters are set and configured only once during initializaiton,
-//     peformance is negligible. Source: "the ready queue is implemented as a
-//     fixed-size buffer paired with an atomic counter. Since we know precisely
-//     how many reactions can at most run in parallel (i.e., the maximum number
-//     of reactions in the APG that have the same level), we can fix the size of
-//     the queue"
-// - The queue will not directly support resizing. The responsibility is offset
-//   to the user, who can create a new queue with a different size and copy the
-//   contents of the old queue to the new one.
-// - Blocks are defined in the heap as the queue is expected to be used in a context where the number of blocks is not
-//   known at compile time. This will result in some performance penalty as we'll be more prone to cache misses.
-// - The index, offset and version fields are stored in a 64-bit integer and accessed using bitwise operations.
-//   I opted to use bitwise operations instead of bit fields or bitsets to ensure portability. Bit fields are
-//   implementation-defined and may not operate as expected across different compilers or platforms. Performance-wise,
-//   bitwise operations are comparable to bit fields.
-//   - Source:
-//   https://stackoverflow.com/questions/2127310/c-c-bitfields-versus-bitwise-operators-to-single-out-bits-which-is-faster-be
 
 #ifndef ATTR_ALWAYS_INLINE
     #if defined(__GNUC__) || defined(__clang__)
@@ -272,9 +264,21 @@ private:
         }
 
         T* entries;
+
+        /// @brief A producer cursor pointing to the last entry in the block allocated for writing.
+        /// @remark If the allocated and committed cursors point to different entries in the block,
+        /// a write operation is still in progress.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> allocated;
+
+        /// @brief A producer cursor pointing to the last entry in the block that has been committed.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> committed;
+
+        /// @brief A consumer cursor pointing to the last entry in the block reserved for consumption.
+        /// @remark If the reserved and consumed cursors point to different entries in the block,
+        /// a read operation is still in progress.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> reserved;
+
+        /// @brief A consumer cursor pointing to the last entry in the block that has been consumed.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> consumed;
     };
 
@@ -319,13 +323,29 @@ private:
         NOT_AVAILABLE = 5,
     };
 
+    /// @brief The number of blocks in the queue.
     const std::size_t block_num_;
+
+    /// @brief The size of each block (number of entries).
+    /// @remark For the total queue size, multiply this by the number of blocks.
     const std::size_t block_size_;
+
+    /// @brief The number of bits in the cursor allocated for the block index.
     const uint32_t idx_bits_;
+
+    /// @brief The number of bits in the cursor allocated for the offset.
     const uint32_t off_bits_;
+
+    /// @brief The number of bits in the control variables allocated for the version.
     const uint32_t vsn_bits_;
+
+    /// @brief The mask for the block index in the queue-level head value.
     const std::size_t idx_mask_;
+
+    /// @brief The mask for the offset in the block-level cursor value.
     const std::size_t off_mask_;
+
+    /// @brief The mask for the version in the control variables.
     const std::size_t vsn_mask_;
 
     /// @brief The internal queue block array.
@@ -381,6 +401,12 @@ private:
         return (off & off_mask_) | ((vsn << off_bits_) & (vsn_mask_ << off_bits_));
     }
 
+    /// @brief Perform an atomic maximum operation on the provided atomic variable.
+    /// @remark This is a pseudo ARM MAX atomic operation implemented using CAS.
+    /// @tparam U The type of the atomic variable. Must be an integral or floating-point type.
+    /// @param var The atomic variable to perform the maximum operation on.
+    /// @param new_val The new value to compare and potentially set as the maximum.
+    /// @return The old value of the atomic variable before the operation.
     template<typename U, typename = std::enable_if_t<std::is_integral_v<U> || std::is_floating_point_v<U>>>
     U atomic_max(std::atomic<U>& var, const U new_val) noexcept
     {
@@ -481,6 +507,7 @@ private:
                     return State::NOT_AVAILABLE;
             }
 
+            // Try to reserve the next entry in the block.
             if (atomic_max(blk->reserved, pkg_cursor(cursor_off(reserved) + 1, cursor_vsn(reserved))) == reserved)
             {
                 entry.offset = cursor_off(reserved);
@@ -501,10 +528,15 @@ private:
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
+            // In retry-new mode, we can safely consume the entry as long as
+            // the reserve operation was successful.
             entry.block->consumed.fetch_add(1, std::memory_order_release);
         }
         else
         {
+            // In drop-old mode, we need to ensure that the entry is still valid
+            // by checking the version of the allocated cursor. It is possible
+            // that the entry was overwritten by a producer after it was reserved.
             std::size_t allocated = entry.block->allocated.load(std::memory_order_acquire);
             if (cursor_vsn(allocated) != entry.version) [[unlikely]]
                 return std::nullopt;
@@ -523,6 +555,8 @@ private:
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
+            // In retry-new mode, the consumer can only advance the head
+            // to the next block if it is fully committed.
             if (cursor_vsn(committed) != block_vsn(ch) + 1)
                 return false;
 
@@ -531,6 +565,8 @@ private:
         }
         else
         {
+            // Version check to maintain FIFO order as producers may have
+            // overwritten entries in the next block.
             if (cursor_vsn(committed) < version + (block_idx(ch) == 0))
                 return false;
 
