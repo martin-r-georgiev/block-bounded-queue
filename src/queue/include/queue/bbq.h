@@ -248,6 +248,21 @@ public:
         }
     }
 
+    /// @brief Checks if the queue is empty.
+    /// @note Pending operations are ignored in this check.
+    /// Entries allocated but not yet committed are not considered part of the queue.
+    /// Reserved entries awaiting consumption still count as present in the queue.
+    /// @return True if the queue is empty, false otherwise.
+    bool empty() const noexcept
+    {
+        Block* blk = get_phead_and_block().second;
+
+        // Load consumed first to prevent it from advancing past committed
+        std::size_t consumed = blk->consumed.load(std::memory_order_acquire);
+        std::size_t committed = blk->committed.load(std::memory_order_acquire);
+        return (cursor_off(consumed) == cursor_off(committed)) && (cursor_vsn(consumed) == cursor_vsn(committed));
+    }
+
 private:
     static constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
