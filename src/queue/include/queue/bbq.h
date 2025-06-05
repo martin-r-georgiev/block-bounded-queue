@@ -157,6 +157,7 @@ public:
     BlockBoundedQueue(std::size_t block_num, std::size_t block_size)
         : block_num_(block_num)
         , block_size_(block_size)
+        , queue_capacity_(block_num * block_size)
         , idx_bits_((block_num > 1) ? static_cast<uint8_t>(std::ceil(std::log2(block_num))) : 1)
         , off_bits_((block_size > 1) ? static_cast<uint8_t>(std::ceil(std::log2(block_size))) + 1 : 1)
         , vsn_bits_(64 - std::max(idx_bits_, off_bits_))
@@ -263,6 +264,8 @@ public:
         return (cursor_off(consumed) == cursor_off(committed)) && (cursor_vsn(consumed) == cursor_vsn(committed));
     }
 
+    ATTR_ALWAYS_INLINE std::size_t capacity() const noexcept { return queue_capacity_; }
+
 private:
     static constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
@@ -351,6 +354,9 @@ private:
     /// @brief The size of each block (number of entries).
     /// @remark For the total queue size, multiply this by the number of blocks.
     const std::size_t block_size_;
+
+    /// @brief The number of elements the queue can store
+    const std::size_t queue_capacity_;
 
     /// @brief The number of bits in the cursor allocated for the block index.
     const uint32_t idx_bits_;
