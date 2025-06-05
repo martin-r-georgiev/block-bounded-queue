@@ -89,6 +89,14 @@
     #endif
 #endif
 
+#ifndef BUILTIN_PREFETCH
+    #if defined(__GNUC__) || defined(__clang__)
+        #define BUILTIN_PREFETCH(addr, rw, locality) __builtin_prefetch((addr), (rw), (locality))
+    #else
+        #define BUILTIN_PREFETCH(addr, rw, locality) ((void)0)
+    #endif
+#endif
+
 namespace queues
 {
 
@@ -430,9 +438,7 @@ private:
     {
         std::size_t ph_val = ph_.load(std::memory_order_acquire);
         Block* blk = blocks_.get() + block_idx(ph_val);
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(blk, 0, 2);
-#endif
+        BUILTIN_PREFETCH(blk, 0, 2);
 
         return {ph_val, blk};
     }
@@ -441,9 +447,7 @@ private:
     {
         std::size_t ch_val = ch_.load(std::memory_order_acquire);
         Block* blk = blocks_.get() + block_idx(ch_val);
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(blk, 0, 2);
-#endif
+        BUILTIN_PREFETCH(blk, 0, 2);
 
         return {ch_val, blk};
     }
@@ -473,6 +477,7 @@ private:
         const std::size_t nblk_idx = (block_idx(ph) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ph) + (nblk_idx == 0 ? 1 : 0);
         Block* nblk = blocks_.get() + nblk_idx;
+        BUILTIN_PREFETCH(nblk, 0, 2);
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
@@ -565,6 +570,7 @@ private:
         const std::size_t nblk_idx = (block_idx(ch) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ch) + (nblk_idx == 0 ? 1 : 0);
         Block* nblk = blocks_.get() + nblk_idx;
+        BUILTIN_PREFETCH(nblk, 0, 2);
 
         std::size_t committed = nblk->committed.load(std::memory_order_acquire);
 
