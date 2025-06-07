@@ -165,6 +165,8 @@ public:
         , off_mask_((off_bits_ < 64) ? ((1ULL << off_bits_) - 1) : ~0ULL)
         , vsn_mask_((vsn_bits_ < 64) ? ((1ULL << vsn_bits_) - 1) : ~0ULL)
         , blocks_(std::make_unique<Block[]>(block_num))
+        , ph_(0)
+        , ch_(0)
     {
         assert(block_num > 0 && block_size > 0 && "Block number and size must be greater than 0.");
 
@@ -203,9 +205,9 @@ public:
                         return OpStatus::BUSY;
                     case State::SUCCESS:
                         goto loop;
-                    default:
+                    [[unlikely]] default:
                         std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
-                        return OpStatus::BUSY; // Fallback OpStatus
+                        return OpStatus::BUSY; // Fallback status
                 }
             [[unlikely]] default:
                 std::fprintf(stderr, "Unexpected state in enqueue: %d\n", static_cast<int>(state));
