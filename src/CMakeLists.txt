@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(bbq_example VERSION 0.1.0)
+project(benchmark_runner VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +27,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${BINARY_DIR})
 
 add_subdirectory(queue)
 
-file(GLOB SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/example/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/example/*.cc")
+file(GLOB SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/*.cc")
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 add_dependencies(${PROJECT_NAME} queue)
 target_link_libraries(${PROJECT_NAME} PRIVATE queue)
