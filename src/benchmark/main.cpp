@@ -98,6 +98,10 @@ struct BenchmarkResult
     uint64_t elapsed_total_us = 0;
     double mean_prod_us = 0.0;
     double mean_cons_us = 0.0;
+    double mean_enq_latency_ns = 0.0;
+    double mean_enq_full_latency_ns = 0.0;
+    double mean_deq_latency_ns = 0.0;
+    double mean_deq_empty_latency_ns = 0.0;
     bool is_bbq = false;
     queues::QueueMode queue_mode = queues::QueueMode::RETRY_NEW;
 };
@@ -192,8 +196,8 @@ void print_benchmark_results(const BenchmarkResult& res)
     print_msg("== Durations ===========================================");
     print_msg(
         std::format("Total elapsed time: {} µs ({:.4f} ms)", res.elapsed_total_us, res.elapsed_total_us / 1000.0));
-    print_msg(std::format("Mean producer time: {} µs ({:.4f} ms)", res.mean_prod_us, res.mean_prod_us / 1000.0));
-    print_msg(std::format("Mean consumer time: {} µs ({:.4f} ms)", res.mean_cons_us, res.mean_cons_us / 1000.0));
+    print_msg(std::format("Mean producer time: {:.4f} µs ({:.4f} ms)", res.mean_prod_us, res.mean_prod_us / 1000.0));
+    print_msg(std::format("Mean consumer time: {:.4f} µs ({:.4f} ms)", res.mean_cons_us, res.mean_cons_us / 1000.0));
 
     print_msg("== Statistics ==========================================");
     if (!res.enq_count.has_value() || !res.deq_count.has_value())
@@ -223,6 +227,15 @@ void print_benchmark_results(const BenchmarkResult& res)
             std::format(":: Fairness (MAX/MIN) = {:.6f}", std::max(mean_prod_throughput, mean_cons_throughput) /
                                                               std::min(mean_prod_throughput, mean_cons_throughput)));
     }
+
+    print_msg(std::format("Mean enqueue latency (OK): {:.4f} ns/op ({:.4f} µs/op)", res.mean_enq_latency_ns,
+                          res.mean_enq_latency_ns / 1000.0));
+    print_msg(std::format("Mean enqueue latency (FULL): {:.4f} ns/op ({:.4f} µs/op)", res.mean_enq_full_latency_ns,
+                          res.mean_enq_full_latency_ns / 1000.0));
+    print_msg(std::format("Mean dequeue latency (OK): {:.4f} ns/op ({:.4f} µs/op)", res.mean_deq_latency_ns,
+                          res.mean_deq_latency_ns / 1000.0));
+    print_msg(std::format("Mean dequeue latency (EMPTY): {:.4f} ns/op ({:.4f} µs/op)", res.mean_deq_empty_latency_ns,
+                          res.mean_deq_empty_latency_ns / 1000.0));
 
     std::cout << std::endl;
 }
@@ -418,6 +431,8 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     // Move data to separate vector arrays to simplify trimming
     std::vector<uint64_t> elapsed_times_us, prod_times_us, cons_times_us;
     std::vector<uint64_t> enq_counts, deq_counts;
+    std::vector<uint64_t> enq_latency_ns, enq_full_latency_ns;
+    std::vector<uint64_t> deq_latency_ns, deq_empty_latency_ns;
 
     for (const auto& r : results)
     {
@@ -430,6 +445,11 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
 
         if (r.deq_count.has_value())
             deq_counts.push_back(r.deq_count.value());
+
+        enq_latency_ns.push_back(r.mean_enq_latency_ns);
+        enq_full_latency_ns.push_back(r.mean_enq_full_latency_ns);
+        deq_latency_ns.push_back(r.mean_deq_latency_ns);
+        deq_empty_latency_ns.push_back(r.mean_deq_empty_latency_ns);
     }
 
     // Trim the results to remove outliers
@@ -440,6 +460,10 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     trim_vector(cons_times_us, TRIM_PERCENTAGE);
     trim_vector(enq_counts, TRIM_PERCENTAGE);
     trim_vector(deq_counts, TRIM_PERCENTAGE);
+    trim_vector(enq_latency_ns, TRIM_PERCENTAGE);
+    trim_vector(enq_full_latency_ns, TRIM_PERCENTAGE);
+    trim_vector(deq_latency_ns, TRIM_PERCENTAGE);
+    trim_vector(deq_empty_latency_ns, TRIM_PERCENTAGE);
 
     // Calculate the mean of the trimmed results
     BenchmarkResult agg = results.front();
@@ -448,6 +472,10 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     agg.mean_cons_us = calculate_mean(cons_times_us);
     agg.enq_count = enq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(enq_counts));
     agg.deq_count = deq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(deq_counts));
+    agg.mean_enq_latency_ns = calculate_mean(enq_latency_ns);
+    agg.mean_enq_full_latency_ns = calculate_mean(enq_full_latency_ns);
+    agg.mean_deq_latency_ns = calculate_mean(deq_latency_ns);
+    agg.mean_deq_empty_latency_ns = calculate_mean(deq_empty_latency_ns);
 
     return agg;
 }
@@ -491,46 +519,56 @@ void run_simple_benchmark(const uint32_t iters, const uint8_t thread_count)
             params,
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                for (uint64_t i = 0; i < BENCHMARK_ITEM_COUNT; i++)
-                    while (bbq.enqueue(i) != queues::OpStatus::OK)
-                        std::this_thread::yield(); // busy-wait
+                uint64_t i = 0;
+                while (i < BENCHMARK_ITEM_COUNT)
+                {
+                    if (bbq.enqueue(i) == queues::OpStatus::OK)
+                    {
+                        ++i;
+                        continue;
+                    }
+
+                    std::this_thread::yield();
+                }
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                alignas(CACHELINE_SIZE) static thread_local std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
+                std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
                 if constexpr (QUEUE_MODE == queues::QueueMode::DROP_OLD)
                 {
                     while (true)
                     {
-                        do
-                        {
-                            buf = bbq.dequeue();
-
-                            if (buf.second == queues::OpStatus::EMPTY && producer_done.load(std::memory_order_acquire))
-                                return nullptr;
-                        } while (buf.second != queues::OpStatus::OK);
+                        buf = bbq.dequeue();
 
                         if constexpr (CORR_CHECKS)
                         {
-                            if (!buf.first.has_value()) [[unlikely]]
-                                abort();
+                            if (buf.second == queues::OpStatus::OK)
+                            {
+                                if (!buf.first.has_value()) [[unlikely]]
+                                    abort();
+                            }
                         }
+
+                        if (buf.second == queues::OpStatus::EMPTY && producer_done.load(std::memory_order_acquire))
+                            return nullptr;
                     }
                 }
                 else
                 {
-                    for (uint64_t i = 0; i < BENCHMARK_ITEM_COUNT; i++)
+                    uint64_t i = 0;
+                    while (i < BENCHMARK_ITEM_COUNT)
                     {
-                        do
+                        buf = bbq.dequeue();
+                        if (buf.second == queues::OpStatus::OK)
                         {
-                            buf = bbq.dequeue();
-                        } while (buf.second != queues::OpStatus::OK);
+                            if constexpr (CORR_CHECKS)
+                            {
+                                // Verify that the dequeued value matches the expected value
+                                if (!buf.first.has_value() || buf.first.value() != i) [[unlikely]]
+                                    abort();
+                            }
 
-                        if constexpr (CORR_CHECKS)
-                        {
-                            // Verify that the dequeued value matches the expected value
-                            if (!buf.first.has_value() || buf.first.value() != i) [[unlikely]]
-                                abort();
+                            ++i;
                         }
                     }
                 }
@@ -570,6 +608,7 @@ void run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const
                            .iteration = -1};
 
     std::cout << "[CPLX] == Logs ================================================" << std::endl;
+    std::cout << "[CPLX] Running throughput benchmarks" << std::endl;
 
     std::vector<BenchmarkResult> results;
     for (uint32_t i = 0; i < iters; ++i)
@@ -596,7 +635,7 @@ void run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                alignas(CACHELINE_SIZE) thread_local std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
+                std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
 
                 if constexpr (QUEUE_MODE == queues::QueueMode::DROP_OLD)
                 {
@@ -663,6 +702,146 @@ void run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const
         results.emplace_back(std::move(res));
     }
 
+    std::cout << "[CPLX] Running latency benchmarks" << std::endl;
+
+    std::mutex op_lat_mutex;
+    std::mutex op_lat_full_mutex;
+    std::mutex op_lat_empty_mutex;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
+        deq_counter.store(0, std::memory_order_release);
+        producers_done.store(false, std::memory_order_release);
+
+        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> deq_latencies_ns;
+        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+
+        params.iteration = i;
+
+        run_benchmark<true>(
+            params,
+            [&]([[maybe_unused]] uint8_t thread_idx)
+            {
+                queues::OpStatus status;
+                uint64_t j = 0;
+                while (j < items_per_prod)
+                {
+                    q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    auto start = std::chrono::steady_clock::now();
+                    status = bbq.enqueue(item_val);
+                    auto end = std::chrono::steady_clock::now();
+
+                    if (status == queues::OpStatus::OK)
+                    {
+                        enq_latencies_ns[item_val] =
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                        j++;
+                    }
+                    else if (status == queues::OpStatus::FULL)
+                    {
+                        std::scoped_lock lock(op_lat_full_mutex);
+                        enq_latencies_full_ns.push_back(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+
+                        std::this_thread::yield();
+                    }
+                    else
+                    {
+                        std::this_thread::yield();
+                    }
+                }
+            },
+            [&]([[maybe_unused]] uint8_t thread_idx)
+            {
+                std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
+
+                if constexpr (QUEUE_MODE == queues::QueueMode::DROP_OLD)
+                {
+                    while (true)
+                    {
+                        auto start = std::chrono::steady_clock::now();
+                        buf = bbq.dequeue();
+                        auto end = std::chrono::steady_clock::now();
+                        if (buf.second == queues::OpStatus::OK)
+                        {
+                            std::scoped_lock lock(op_lat_mutex);
+                            deq_latencies_ns.push_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        }
+                        else if (buf.second == queues::OpStatus::EMPTY)
+                        {
+                            if (producers_done.load(std::memory_order_acquire))
+                                break; // Exit: producers are done and queue is empty
+
+                            {
+                                std::scoped_lock lock(op_lat_empty_mutex);
+                                deq_latencies_empty_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                }
+                else
+                {
+                    while (deq_counter.load(std::memory_order_acquire) < BENCHMARK_ITEM_COUNT)
+                    {
+                        auto start = std::chrono::steady_clock::now();
+                        buf = bbq.dequeue();
+                        auto end = std::chrono::steady_clock::now();
+                        if (buf.second == queues::OpStatus::OK)
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_mutex);
+                                deq_latencies_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        else if (buf.second == queues::OpStatus::EMPTY)
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_empty_mutex);
+                                deq_latencies_empty_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                }
+            });
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
+            results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+            results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
 }
@@ -689,11 +868,12 @@ void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, con
                            .iteration = -1};
 
     std::cout << "[STL] == Logs ================================================" << std::endl;
+    std::cout << "[STL] Running throughput benchmarks" << std::endl;
 
     std::vector<BenchmarkResult> results;
     for (uint32_t i = 0; i < iters; ++i)
     {
-        alignas(CACHELINE_SIZE) std::queue<q_val_t> stl_queue;
+        std::queue<q_val_t> stl_queue;
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
@@ -716,10 +896,15 @@ void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, con
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                while (deq_counter.load(std::memory_order_acquire) < BENCHMARK_ITEM_COUNT)
+                while (deq_counter.load(std::memory_order_relaxed) < BENCHMARK_ITEM_COUNT)
                 {
                     std::unique_lock<std::mutex> lock(stl_mtx);
-                    stl_cv.wait(lock, [&] { return !stl_queue.empty() || deq_counter.load() >= BENCHMARK_ITEM_COUNT; });
+                    stl_cv.wait(lock,
+                                [&]
+                                {
+                                    return !stl_queue.empty() ||
+                                           deq_counter.load(std::memory_order_relaxed) >= BENCHMARK_ITEM_COUNT;
+                                });
                     if (!stl_queue.empty())
                     {
                         stl_queue.pop();
@@ -729,6 +914,87 @@ void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, con
             });
 
         results.emplace_back(std::move(res));
+    }
+
+    std::cout << "[STL] Running latency benchmarks" << std::endl;
+
+    std::mutex op_lat_mutex;
+    std::mutex op_lat_full_mutex;
+    std::mutex op_lat_empty_mutex;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        std::queue<q_val_t> stl_queue;
+        deq_counter.store(0, std::memory_order_release);
+
+        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> deq_latencies_ns;
+        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+
+        params.iteration = i;
+
+        run_benchmark<false>(
+            params,
+            [&]([[maybe_unused]] uint8_t thread_idx)
+            {
+                for (uint32_t j = 0; j < items_per_prod; j++)
+                {
+                    q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    auto start = std::chrono::steady_clock::now();
+                    {
+                        std::unique_lock<std::mutex> lock(stl_mtx);
+                        stl_queue.push(item_val);
+                    }
+                    auto end = std::chrono::steady_clock::now();
+                    enq_latencies_ns[item_val] =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+                    stl_cv.notify_one();
+                }
+            },
+            [&]([[maybe_unused]] uint8_t thread_idx)
+            {
+                while (deq_counter.load(std::memory_order_relaxed) < BENCHMARK_ITEM_COUNT)
+                {
+                    std::unique_lock<std::mutex> lock(stl_mtx);
+                    stl_cv.wait(lock,
+                                [&]
+                                {
+                                    return !stl_queue.empty() ||
+                                           deq_counter.load(std::memory_order_relaxed) >= BENCHMARK_ITEM_COUNT;
+                                });
+
+                    auto start = std::chrono::steady_clock::now();
+                    if (!stl_queue.empty())
+                    {
+                        stl_queue.pop();
+                        auto end = std::chrono::steady_clock::now();
+                        deq_latencies_ns.push_back(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        deq_counter.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        auto end = std::chrono::steady_clock::now();
+                        deq_latencies_empty_ns.push_back(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                    }
+                }
+            });
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
+            results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+            results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
     }
 
     auto aggr = aggregate_results(results);
@@ -796,6 +1062,8 @@ void print_help(const std::string& program_name)
     std::cout << "    -t <N>, --threads <N>      Set the number of threads to use (default: 2)." << std::endl;
 }
 // clang-format on
+
+// TODO: Test other queues: DPDK rb, sync_bounded_queue (Boost), MPSCQueue (Folly), power-of-two rb (Linux kernel)
 
 int main(int argc, char** argv)
 {
