@@ -19,6 +19,11 @@
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/thread/sync_bounded_queue.hpp>
 
+#ifdef ENABLE_FOLLY_BENCHMARKS
+    #include <folly/MPMCQueue.h>
+    #include <folly/ProducerConsumerQueue.h>
+#endif
+
 constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
 using q_val_t = uint64_t;
@@ -1018,7 +1023,7 @@ void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, con
 // Based on example from Boost documentation:
 // https://www.boost.org/doc/libs/master/doc/html/lockfree/examples.html
 void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                                        const uint8_t thread_count)
+                                        const uint8_t thread_count, bool disable_optimized_spsc = false)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -1053,7 +1058,7 @@ void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t nu
 
     std::cout << "[BST-LFQ] == Logs ================================================" << std::endl;
 
-    if (num_prod == 1 && num_cons == 1)
+    if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         std::cout << "[BST-LFQ] Using wait-free single-producer/single-consumer (SPSC) queue." << std::endl;
     else
         std::cout << "[BST-LFQ] Using lock-free multi-producer/multi-consumer (MPMC) queue." << std::endl;
@@ -1069,7 +1074,7 @@ void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t nu
 
         params.iteration = i;
 
-        if (num_prod == 1 && num_cons == 1)
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
             auto boost_spsc_q =
                 std::make_unique<boost::lockfree::spsc_queue<q_val_t, boost::lockfree::capacity<Q_CAPACITY>>>();
@@ -1174,7 +1179,7 @@ void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t nu
 
         params.iteration = i;
 
-        if (num_prod == 1 && num_cons == 1)
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
             auto boost_spsc_q =
                 std::make_unique<boost::lockfree::spsc_queue<q_val_t, boost::lockfree::capacity<Q_CAPACITY>>>();
@@ -1537,6 +1542,353 @@ void run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, const uint8_
     print_benchmark_results(aggr);
 }
 
+#ifdef ENABLE_FOLLY_BENCHMARKS
+void run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
+                          const uint8_t thread_count, bool disable_optimized_spsc = false)
+{
+    alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
+    alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
+    alignas(CACHELINE_SIZE) std::atomic<bool> producers_done{false};
+    alignas(CACHELINE_SIZE) BenchmarkResult res;
+
+    std::mutex queue_mutex;
+    std::vector<q_val_t> deq_items;
+    if constexpr (CORR_CHECKS)
+        deq_items.reserve(BENCHMARK_ITEM_COUNT);
+
+    alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
+
+    BenchmarkParams params{.label = "FOLLYQ",
+                           .thread_count = thread_count,
+                           .item_count = BENCHMARK_ITEM_COUNT,
+                           .num_prod = num_prod,
+                           .num_cons = num_cons,
+                           .enq_counter = enq_counter,
+                           .deq_counter = deq_counter,
+                           .deq_items = &deq_items,
+                           .producers_done = &producers_done,
+                           .iteration = -1};
+
+    std::cout << "[FOLLYQ] == Logs ================================================" << std::endl;
+
+    if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
+        std::cout << "[FOLLYQ] Using single-producer/single-consumer ProducerConsumerQueue." << std::endl;
+    else
+        std::cout << "[FOLLYQ] Using multi-producer/multi-consumer MPMCQueue." << std::endl;
+
+    std::cout << "[FOLLYQ] Running throughput benchmarks..." << std::endl;
+
+    std::vector<BenchmarkResult> results;
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        producers_done.store(false, std::memory_order_release);
+        enq_counter.store(0, std::memory_order_release);
+        deq_counter.store(0, std::memory_order_release);
+
+        params.iteration = i;
+
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
+        {
+            folly::ProducerConsumerQueue<q_val_t> folly_q{BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK};
+
+            res = run_benchmark(
+                params,
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    bool success;
+                    uint64_t j = 0;
+                    while (j < items_per_prod)
+                    {
+                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        success = folly_q.write(std::move(item_val));
+                        if (success)
+                        {
+                            enq_counter.fetch_add(1, std::memory_order_relaxed);
+                            j++;
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                },
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    q_val_t item_val;
+                    bool success;
+                    while (true)
+                    {
+                        success = folly_q.read(item_val);
+                        if (success)
+                        {
+                            if constexpr (CORR_CHECKS)
+                            {
+                                std::scoped_lock lock(queue_mutex);
+                                deq_items.emplace_back(item_val);
+                            }
+
+                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        else if (folly_q.isEmpty())
+                        {
+                            if (producers_done.load(std::memory_order_acquire))
+                                break; // Exit: producers are done and queue is empty
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+        }
+        else
+        {
+            folly::MPMCQueue<q_val_t, std::atomic, false> folly_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
+
+            res = run_benchmark(
+                params,
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    bool success;
+                    uint64_t j = 0;
+                    while (j < items_per_prod)
+                    {
+                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        success = folly_q.write(std::move(item_val));
+                        if (success)
+                        {
+                            enq_counter.fetch_add(1, std::memory_order_relaxed);
+                            j++;
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                },
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    q_val_t item_val;
+                    bool success;
+                    while (true)
+                    {
+                        success = folly_q.read(item_val);
+                        if (success)
+                        {
+                            if constexpr (CORR_CHECKS)
+                            {
+                                std::scoped_lock lock(queue_mutex);
+                                deq_items.emplace_back(item_val);
+                            }
+
+                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        else if (folly_q.isEmpty())
+                        {
+                            if (producers_done.load(std::memory_order_acquire))
+                                break; // Exit: producers are done and queue is empty
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+        }
+
+        results.emplace_back(std::move(res));
+    }
+
+    std::cout << "[FOLLYQ] Running latency benchmarks..." << std::endl;
+
+    std::mutex op_lat_mutex;
+    std::mutex op_lat_full_mutex;
+    std::mutex op_lat_empty_mutex;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        producers_done.store(false, std::memory_order_release);
+
+        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> deq_latencies_ns;
+        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+
+        params.iteration = i;
+
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
+        {
+            folly::ProducerConsumerQueue<q_val_t> folly_q{BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK};
+
+            run_benchmark(
+                params,
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    bool success;
+                    uint64_t j = 0;
+                    while (j < items_per_prod)
+                    {
+                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        auto start = std::chrono::steady_clock::now();
+                        success = folly_q.write(std::move(item_val));
+                        auto end = std::chrono::steady_clock::now();
+                        if (success)
+                        {
+                            enq_latencies_ns[item_val] =
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                            j++;
+                        }
+                        else if (folly_q.isFull())
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_full_mutex);
+                                enq_latencies_full_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                },
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    q_val_t item_val;
+                    bool success;
+                    while (true)
+                    {
+                        auto start = std::chrono::steady_clock::now();
+                        success = folly_q.read(item_val);
+                        auto end = std::chrono::steady_clock::now();
+                        if (success)
+                        {
+                            std::scoped_lock lock(op_lat_mutex);
+                            deq_latencies_ns.push_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        }
+                        else if (folly_q.isEmpty())
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_empty_mutex);
+                                deq_latencies_empty_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            if (producers_done.load(std::memory_order_acquire))
+                                break; // Exit: producers are done and queue is empty
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+        }
+        else
+        {
+            folly::MPMCQueue<q_val_t, std::atomic, false> folly_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
+
+            run_benchmark(
+                params,
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    bool success;
+                    uint64_t j = 0;
+                    while (j < items_per_prod)
+                    {
+                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        auto start = std::chrono::steady_clock::now();
+                        success = folly_q.write(std::move(item_val));
+                        auto end = std::chrono::steady_clock::now();
+                        if (success)
+                        {
+                            enq_latencies_ns[item_val] =
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                            j++;
+                        }
+                        else if (folly_q.isFull())
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_full_mutex);
+                                enq_latencies_full_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                },
+                [&]([[maybe_unused]] uint8_t thread_idx)
+                {
+                    q_val_t item_val;
+                    bool success;
+                    while (true)
+                    {
+                        auto start = std::chrono::steady_clock::now();
+                        success = folly_q.read(item_val);
+                        auto end = std::chrono::steady_clock::now();
+                        if (success)
+                        {
+                            std::scoped_lock lock(op_lat_mutex);
+                            deq_latencies_ns.push_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        }
+                        else if (folly_q.isEmpty())
+                        {
+                            {
+                                std::scoped_lock lock(op_lat_empty_mutex);
+                                deq_latencies_empty_ns.push_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            }
+
+                            if (producers_done.load(std::memory_order_acquire))
+                                break; // Exit: producers are done and queue is empty
+
+                            std::this_thread::yield();
+                        }
+                        else
+                        {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+        }
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
+            results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+            results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    auto aggr = aggregate_results(results);
+    print_benchmark_results(aggr);
+}
+#endif
+
 enum class TestMode
 {
     SIMPLE,
@@ -1544,6 +1896,9 @@ enum class TestMode
     STL,
     BOOST_LFQ,
     BOOST_SYNC_BOUNDED,
+#ifdef ENABLE_FOLLY_BENCHMARKS
+    FOLLYQ,
+#endif
     UNKNOWN
 };
 
@@ -1580,6 +1935,10 @@ TestMode parse_mode(const std::string& mode)
         return TestMode::BOOST_LFQ;
     if (lower_mode == "boost-bsyncq")
         return TestMode::BOOST_SYNC_BOUNDED;
+#ifdef ENABLE_FOLLY_BENCHMARKS
+    if (lower_mode == "follyq")
+        return TestMode::FOLLYQ;
+#endif
 
     return TestMode::UNKNOWN;
 }
@@ -1600,12 +1959,20 @@ void print_help(const std::string& program_name)
     std::cout << "                    on the Boost lockfree queue. All options are supported." << std::endl;
     std::cout << "    boost-bsyncq    Run a configurable multi-producer/multi-consumer benchmark" << std::endl;
     std::cout << "                    on the Boost sync_bounded_queue. All options are supported." << std::endl;
+    #ifdef ENABLE_FOLLY_BENCHMARKS
+    std::cout << "    follyq          Run a configurable multi-producer/multi-consumer benchmark" << std::endl;
+    std::cout << "                    on the Folly MPMC queue. All options are supported." << std::endl;
+    #endif
     std::cout << std::endl << "Options:" << std::endl;
     std::cout << "    -h, --help                 Show this help message.\n" << std::endl;
     std::cout << "    -p <N>, --producers <N>    Set the number of producers (default: 1)." << std::endl;
     std::cout << "    -c <N>, --consumers <N>    Set the number of consumers (default: 1)." << std::endl;
     std::cout << "    -i <N>, --iterations <N>   Set the number of iterations to run (default: 1)." << std::endl;
     std::cout << "    -t <N>, --threads <N>      Set the number of threads to use (default: 2)." << std::endl;
+    std::cout << "    --disable-optimized-spsc   Disable the use of SPSC queue variants." << std::endl;
+    std::cout << "                               Some libraries offer faster SPSC queue data" << std::endl;
+    std::cout << "                               structures, which may skew results." << std::endl;
+    std::cout << "                               Use this option to disable their use." << std::endl;
 }
 // clang-format on
 
@@ -1617,6 +1984,7 @@ int main(int argc, char** argv)
     uint32_t num_iter = 1;
     uint8_t num_threads = 2;
     bool show_help = false;
+    bool disable_optimized_spsc = false;
 
     // Parse command line args
     // Note(s):
@@ -1691,6 +2059,10 @@ int main(int argc, char** argv)
                           << "Limiting to " << std::thread::hardware_concurrency() << "." << std::endl;
             }
         }
+        else if (arg == "--disable-optimized-spsc")
+        {
+            disable_optimized_spsc = true;
+        }
         else
         {
             benchmark_mode = arg; // Assume the first non-option argument is the mode
@@ -1715,11 +2087,16 @@ int main(int argc, char** argv)
             run_stl_queue_benchmark(num_prod, num_cons, num_iter, num_threads);
             break;
         case TestMode::BOOST_LFQ:
-            run_boost_lockfree_queue_benchmark(num_prod, num_cons, num_iter, num_threads);
+            run_boost_lockfree_queue_benchmark(num_prod, num_cons, num_iter, num_threads, disable_optimized_spsc);
             break;
         case TestMode::BOOST_SYNC_BOUNDED:
             run_boost_sync_bounded_queue_benchmark(num_prod, num_cons, num_iter, num_threads);
             break;
+#ifdef ENABLE_FOLLY_BENCHMARKS
+        case TestMode::FOLLYQ:
+            run_follyq_benchmark(num_prod, num_cons, num_iter, num_threads, disable_optimized_spsc);
+            break;
+#endif
         default:
             std::cerr << "Unknown mode provided: " << argv[1] << std::endl;
             return 1;

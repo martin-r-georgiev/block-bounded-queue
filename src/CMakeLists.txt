@@ -32,11 +32,30 @@ FetchContent_Declare(
 )
 
 if(NOT EXISTS "${FETCHCONTENT_BASE_DIR}/boost-src")
-    message(STATUS "Boost library not found. Fetching boost library...")
+    message(STATUS "Boost library not found. Fetching boost...")
     FetchContent_Populate(boost)
 endif()
 
 FetchContent_MakeAvailable(boost)
+
+# glog (Google Logging)
+# set(GLOG_VER v0.7.1)
+# FetchContent_Declare(
+#   glog
+#   GIT_REPOSITORY https://github.com/google/glog.git
+#   GIT_TAG        ${GLOG_VER}
+# )
+
+# if(NOT EXISTS "${FETCHCONTENT_BASE_DIR}/glog-src")
+#     message(STATUS "Google Logging library not found. Fetching glog...")
+#     FetchContent_Populate(glog)
+# endif()
+
+# FetchContent_MakeAvailable(glog)
+
+# Folly
+find_package(glog QUIET)
+find_package(folly QUIET)
 
 get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -51,4 +70,15 @@ add_subdirectory(queue)
 file(GLOB SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/*.cc")
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 add_dependencies(${PROJECT_NAME} queue Boost::thread Boost::lockfree)
+
+if(folly_FOUND AND glog_FOUND)
+    message(STATUS "Found optional glog (folly dependency).")
+    message(STATUS "Found optional folly library. Enabling folly benchmarks.")
+    target_link_libraries(${PROJECT_NAME} PRIVATE folly glog::glog)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_FOLLY_BENCHMARKS=1)
+else()
+    message(STATUS "Folly library not found. Skipping folly benchmarks.")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_FOLLY_BENCHMARKS=0)
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE queue Boost::thread Boost::lockfree)
