@@ -105,12 +105,19 @@ struct BenchmarkResult
     std::optional<uint64_t> deq_count = std::nullopt;
     std::vector<q_val_t>* deq_items;
     uint64_t elapsed_total_us = 0;
+    double stddev_elapsed_total_us = 0.0;
     double mean_prod_us = 0.0;
+    double stddev_prod_us = 0.0;
     double mean_cons_us = 0.0;
+    double stddev_cons_us = 0.0;
     double mean_enq_latency_ns = 0.0;
+    double stddev_enq_latency_ns = 0.0;
     double mean_enq_full_latency_ns = 0.0;
+    double stddev_enq_full_latency_ns = 0.0;
     double mean_deq_latency_ns = 0.0;
+    double stddev_deq_latency_ns = 0.0;
     double mean_deq_empty_latency_ns = 0.0;
+    double stddev_deq_empty_latency_ns = 0.0;
     bool is_bbq = false;
     queues::QueueMode queue_mode = queues::QueueMode::RETRY_NEW;
 };
@@ -130,6 +137,51 @@ struct BenchmarkParams
     bool is_bbq = false;
     int iteration = -1;
 };
+
+enum class TimeUnit : uint8_t
+{
+    NANOSECONDS = 0,
+    MICROSECONDS = 1,
+    MILLISECONDS = 2,
+    SECONDS = 3
+};
+
+std::string time_unit_to_string(TimeUnit unit)
+{
+    switch (unit)
+    {
+        case TimeUnit::NANOSECONDS:
+            return "ns";
+        case TimeUnit::MICROSECONDS:
+            return "µs";
+        case TimeUnit::MILLISECONDS:
+            return "ms";
+        case TimeUnit::SECONDS:
+            return "s";
+        default:
+            return "unknown";
+    }
+}
+
+template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
+std::string round_up_measurement(T val, TimeUnit val_unit, std::string_view suffix = "")
+{
+    double calculation = val;
+    TimeUnit current_unit = val_unit;
+    while (calculation >= 1000 && current_unit != TimeUnit::SECONDS)
+    {
+        calculation /= 1000;
+        current_unit = static_cast<TimeUnit>(static_cast<uint8_t>(current_unit) + 1);
+    }
+
+    // If the value is an integer, format it without decimal places
+    if constexpr (std::is_integral_v<T>)
+        return std::format("{} {}{}", calculation, time_unit_to_string(current_unit), suffix);
+    else if (std::abs(std::round(calculation) - calculation) < 0.0001f)
+        return std::format("{:.0f} {}{}", static_cast<double>(calculation), time_unit_to_string(current_unit), suffix);
+    else
+        return std::format("{:.4f} {}{}", static_cast<double>(calculation), time_unit_to_string(current_unit), suffix);
+}
 
 /// @brief Pretty-prints the (aggregate) benchmark results to the console.
 /// @param res The set of benchmark results to print.
@@ -152,6 +204,15 @@ void print_benchmark_results(const BenchmarkResult& res)
     if (res.is_bbq)
         print_msg(
             std::format("Queue mode: {}", res.queue_mode == queues::QueueMode::DROP_OLD ? "DROP OLD" : "RETRY NEW"));
+
+    std::cout << std::endl;
+    print_msg("== Acronyms ===========================================");
+    print_msg("SD: Standard Deviation");
+    print_msg("ENQ: Enqueue operation");
+    print_msg("DEQ: Dequeue operation");
+    print_msg("OK: Operation completed successfully");
+    print_msg("FULL: Operation failed due to full queue");
+    print_msg("EMPTY: Operation failed due to empty queue");
 
     // Show correctness information only where applicable
     if (!res.is_bbq || (res.is_bbq && res.queue_mode == queues::QueueMode::RETRY_NEW))
@@ -204,10 +265,15 @@ void print_benchmark_results(const BenchmarkResult& res)
 
     std::cout << std::endl;
     print_msg("== Durations ===========================================");
-    print_msg(
-        std::format("Total elapsed time: {} µs ({:.4f} ms)", res.elapsed_total_us, res.elapsed_total_us / 1000.0));
-    print_msg(std::format("Mean producer time: {:.4f} µs ({:.4f} ms)", res.mean_prod_us, res.mean_prod_us / 1000.0));
-    print_msg(std::format("Mean consumer time: {:.4f} µs ({:.4f} ms)", res.mean_cons_us, res.mean_cons_us / 1000.0));
+    print_msg(std::format("Total elapsed time: {:<18} [SD: {}]",
+                          round_up_measurement(res.elapsed_total_us, TimeUnit::MICROSECONDS),
+                          round_up_measurement(res.stddev_elapsed_total_us, TimeUnit::MICROSECONDS)));
+    print_msg(std::format("Mean producer time: {:<18} [SD: {}]",
+                          round_up_measurement(res.mean_prod_us, TimeUnit::MICROSECONDS),
+                          round_up_measurement(res.stddev_prod_us, TimeUnit::MICROSECONDS)));
+    print_msg(std::format("Mean consumer time: {:<18} [SD: {}]",
+                          round_up_measurement(res.mean_cons_us, TimeUnit::MICROSECONDS),
+                          round_up_measurement(res.stddev_cons_us, TimeUnit::MICROSECONDS)));
 
     print_msg("== Statistics ==========================================");
     if (!res.enq_count.has_value() || !res.deq_count.has_value())
@@ -245,14 +311,18 @@ void print_benchmark_results(const BenchmarkResult& res)
     }
     else
     {
-        print_msg(std::format("Mean enqueue latency (OK): {:.4f} ns/op ({:.4f} µs/op)", res.mean_enq_latency_ns,
-                              res.mean_enq_latency_ns / 1000.0));
-        print_msg(std::format("Mean enqueue latency (FULL): {:.4f} ns/op ({:.4f} µs/op)", res.mean_enq_full_latency_ns,
-                              res.mean_enq_full_latency_ns / 1000.0));
-        print_msg(std::format("Mean dequeue latency (OK): {:.4f} ns/op ({:.4f} µs/op)", res.mean_deq_latency_ns,
-                              res.mean_deq_latency_ns / 1000.0));
-        print_msg(std::format("Mean dequeue latency (EMPTY): {:.4f} ns/op ({:.4f} µs/op)",
-                              res.mean_deq_empty_latency_ns, res.mean_deq_empty_latency_ns / 1000.0));
+        print_msg(std::format("Mean ENQ latency (OK):    {:<14} [SD: {}]",
+                              round_up_measurement(res.mean_enq_latency_ns, TimeUnit::NANOSECONDS, "/op"),
+                              round_up_measurement(res.stddev_enq_latency_ns, TimeUnit::NANOSECONDS, "/op")));
+        print_msg(std::format("Mean ENQ latency (FULL):  {:<14} [SD: {}]",
+                              round_up_measurement(res.mean_enq_full_latency_ns, TimeUnit::NANOSECONDS, "/op"),
+                              round_up_measurement(res.stddev_enq_full_latency_ns, TimeUnit::NANOSECONDS, "/op")));
+        print_msg(std::format("Mean DEQ latency (OK):    {:<14} [SD: {}]",
+                              round_up_measurement(res.mean_deq_latency_ns, TimeUnit::NANOSECONDS, "/op"),
+                              round_up_measurement(res.stddev_deq_latency_ns, TimeUnit::NANOSECONDS, "/op")));
+        print_msg(std::format("Mean DEQ latency (EMPTY): {:<14} [SD: {}]",
+                              round_up_measurement(res.mean_deq_empty_latency_ns, TimeUnit::NANOSECONDS, "/op"),
+                              round_up_measurement(res.stddev_deq_empty_latency_ns, TimeUnit::NANOSECONDS, "/op")));
     }
 
     std::cout << std::endl;
@@ -430,6 +500,30 @@ double calculate_mean(const std::vector<T>& v)
 }
 
 /**
+ * @brief Calculates the standard deviation of the provided vector.
+ *
+ * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
+ * @param v The target vector to calculate the standard deviation of.
+ * @return double The resulting standard deviation value.
+ */
+template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
+double calculate_std_dev(const std::vector<T>& v)
+{
+    if (v.empty())
+        return 0.0;
+
+    double mean = calculate_mean(v);
+    double accum = 0.0;
+    for (const auto& val : v)
+    {
+        double diff = static_cast<double>(val) - mean;
+        accum += diff * diff;
+    }
+
+    return std::sqrt(accum / v.size());
+}
+
+/**
  * @brief Trims and aggregates results multiple benchmark runs.
  *
  * @param results The vector of BenchmarkResult objects to trim and aggregate.
@@ -472,6 +566,7 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     // Trim the results to remove outliers
     std::cout << "Trimming results by " << (TRIM_PERCENTAGE * 100.0) << "% from both ends to remove outliers..."
               << std::endl;
+    std::size_t size_before_trim = elapsed_times_us.size();
     trim_vector(elapsed_times_us, TRIM_PERCENTAGE);
     trim_vector(prod_times_us, TRIM_PERCENTAGE);
     trim_vector(cons_times_us, TRIM_PERCENTAGE);
@@ -481,18 +576,27 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     trim_vector(enq_full_latency_ns, TRIM_PERCENTAGE);
     trim_vector(deq_latency_ns, TRIM_PERCENTAGE);
     trim_vector(deq_empty_latency_ns, TRIM_PERCENTAGE);
+    std::cout << std::format("Trimmed {}/{} results.", size_before_trim - elapsed_times_us.size(), size_before_trim)
+              << std::endl;
 
     // Calculate the mean of the trimmed results
     BenchmarkResult agg = results.front();
     agg.elapsed_total_us = static_cast<uint64_t>(calculate_mean(elapsed_times_us));
+    agg.stddev_elapsed_total_us = calculate_std_dev(elapsed_times_us);
     agg.mean_prod_us = calculate_mean(prod_times_us);
+    agg.stddev_prod_us = calculate_std_dev(prod_times_us);
     agg.mean_cons_us = calculate_mean(cons_times_us);
+    agg.stddev_cons_us = calculate_std_dev(cons_times_us);
     agg.enq_count = enq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(enq_counts));
     agg.deq_count = deq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(deq_counts));
     agg.mean_enq_latency_ns = calculate_mean(enq_latency_ns);
+    agg.stddev_enq_latency_ns = calculate_std_dev(enq_latency_ns);
     agg.mean_enq_full_latency_ns = calculate_mean(enq_full_latency_ns);
+    agg.stddev_enq_full_latency_ns = calculate_std_dev(enq_full_latency_ns);
     agg.mean_deq_latency_ns = calculate_mean(deq_latency_ns);
+    agg.stddev_deq_latency_ns = calculate_std_dev(deq_latency_ns);
     agg.mean_deq_empty_latency_ns = calculate_mean(deq_empty_latency_ns);
+    agg.stddev_deq_empty_latency_ns = calculate_std_dev(deq_empty_latency_ns);
 
     return agg;
 }
