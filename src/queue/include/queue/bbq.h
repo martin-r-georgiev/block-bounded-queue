@@ -154,7 +154,7 @@ public:
      * @remark The length of the offset needs to be larger than log2(block_size)
      * to allow for FAA-overflow detection.
      */
-    BlockBoundedQueue(std::size_t block_num, std::size_t block_size)
+    BlockBoundedQueue(const std::size_t block_num, const std::size_t block_size)
         : block_num_(block_num)
         , block_size_(block_size)
         , queue_capacity_(block_num * block_size)
@@ -276,7 +276,7 @@ private:
     {
         Block() : entries(nullptr), allocated(0), committed(0), reserved(0), consumed(0) {}
 
-        void init(const BlockBoundedQueue* parent, const std::size_t num_entries, bool is_first)
+        void init(const BlockBoundedQueue* parent, const std::size_t num_entries, const bool is_first)
         {
             entries = std::make_unique<T[]>(num_entries);
 
@@ -407,7 +407,7 @@ private:
     /// @param idx The index of the the head.
     /// @param vsn The version of the the head.
     /// @return The packed value containing the index and version.
-    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_head(std::size_t idx, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_head(const std::size_t idx, const std::size_t vsn) const noexcept
     {
         return (idx & idx_mask_) | ((vsn << idx_bits_) & (vsn_mask_ << idx_bits_));
     }
@@ -432,7 +432,7 @@ private:
     /// @brief Packs the segment offset and version back into a single value.
     /// @param off The offset of the cursor in the block.
     /// @param vsn The version of the cursor in the block.
-    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_cursor(std::size_t off, std::size_t vsn) const noexcept
+    ATTR_ALWAYS_INLINE constexpr std::size_t pkg_cursor(const std::size_t off, const std::size_t vsn) const noexcept
     {
         return (off & off_mask_) | ((vsn << off_bits_) & (vsn_mask_ << off_bits_));
     }
@@ -459,7 +459,7 @@ private:
 
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
-        std::size_t ph_val = ph_.load(std::memory_order_acquire);
+        const std::size_t ph_val = ph_.load(std::memory_order_acquire);
         Block* blk = blocks_.get() + block_idx(ph_val);
         BUILTIN_PREFETCH(blk, 0, 2);
 
@@ -468,7 +468,7 @@ private:
 
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
-        std::size_t ch_val = ch_.load(std::memory_order_acquire);
+        const std::size_t ch_val = ch_.load(std::memory_order_acquire);
         Block* blk = blocks_.get() + block_idx(ch_val);
         BUILTIN_PREFETCH(blk, 0, 2);
 
@@ -477,11 +477,11 @@ private:
 
     const State allocate_entry(Block* blk, EntryDesc& entry) noexcept
     {
-        std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
+        const std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
         if (cursor_off(allocated) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
-        std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_acq_rel);
+        const std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_acq_rel);
         if (cursor_off(old_cursor) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
@@ -506,11 +506,11 @@ private:
         {
             // In retry-new mode, we can only advance the P.Head to the next block
             // if the next block is fully consumed.
-            std::size_t consumed = nblk->consumed.load(std::memory_order_acquire);
+            const std::size_t consumed = nblk->consumed.load(std::memory_order_acquire);
             if (cursor_vsn(consumed) < block_vsn(ph) ||
                 (cursor_vsn(consumed) == block_vsn(ph) && cursor_off(consumed) != block_size_))
             {
-                std::size_t reserved = nblk->reserved.load(std::memory_order_acquire);
+                const std::size_t reserved = nblk->reserved.load(std::memory_order_acquire);
                 return (cursor_off(reserved) == cursor_off(consumed)) ? State::NO_ENTRY : State::NOT_AVAILABLE;
             }
         }
@@ -518,7 +518,7 @@ private:
         {
             // In drop-old mode, we can always advance the P.Head to the next block
             // as long as the next block is fully committed.
-            std::size_t committed = nblk->committed.load(std::memory_order_acquire);
+            const std::size_t committed = nblk->committed.load(std::memory_order_acquire);
             if (cursor_vsn(committed) == block_vsn(ph) && cursor_off(committed) < block_size_) [[unlikely]]
                 return State::NOT_AVAILABLE;
         }
@@ -533,11 +533,11 @@ private:
     State reserve_entry(Block* blk, EntryDesc& entry) noexcept
     {
     again:
-        std::size_t reserved = blk->reserved.load(std::memory_order_acquire);
+        const std::size_t reserved = blk->reserved.load(std::memory_order_acquire);
         if (cursor_off(reserved) < block_size_) [[likely]]
         {
             // Check if all committed entries have already been reserved for consumption.
-            std::size_t committed = blk->committed.load(std::memory_order_acquire);
+            const std::size_t committed = blk->committed.load(std::memory_order_acquire);
             if (cursor_off(reserved) == cursor_off(committed))
                 return State::NO_ENTRY;
 
@@ -545,7 +545,7 @@ private:
             // check if there are any pending allocation operations.
             if (cursor_off(committed) != block_size_)
             {
-                std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
+                const std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
                 if (cursor_off(allocated) != cursor_off(committed))
                     return State::NOT_AVAILABLE;
             }
@@ -580,7 +580,7 @@ private:
             // In drop-old mode, we need to ensure that the entry is still valid
             // by checking the version of the allocated cursor. It is possible
             // that the entry was overwritten by a producer after it was reserved.
-            std::size_t allocated = entry.block->allocated.load(std::memory_order_acquire);
+            const std::size_t allocated = entry.block->allocated.load(std::memory_order_acquire);
             if (cursor_vsn(allocated) != entry.version) [[unlikely]]
                 return std::nullopt;
         }
@@ -595,7 +595,7 @@ private:
         Block* nblk = blocks_.get() + nblk_idx;
         BUILTIN_PREFETCH(nblk, 0, 2);
 
-        std::size_t committed = nblk->committed.load(std::memory_order_acquire);
+        const std::size_t committed = nblk->committed.load(std::memory_order_acquire);
 
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
