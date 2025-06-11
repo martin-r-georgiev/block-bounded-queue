@@ -46,6 +46,8 @@ constexpr bool CORR_CHECKS = false;
 // Percentage of results to trim from both ends
 constexpr double TRIM_PERCENTAGE = 0.1;
 
+constexpr double NS_PER_SEC = 1'000'000'000.0;
+
 #if defined(__linux__)
     #include <sched.h>
 
@@ -109,12 +111,12 @@ struct BenchmarkResult
     std::optional<uint64_t> enq_count = std::nullopt;
     std::optional<uint64_t> deq_count = std::nullopt;
     std::vector<q_val_t>* deq_items;
-    double elapsed_total_us = 0;
-    double stddev_elapsed_total_us = 0.0;
-    double mean_prod_us = 0.0;
-    double stddev_prod_us = 0.0;
-    double mean_cons_us = 0.0;
-    double stddev_cons_us = 0.0;
+    double elapsed_total_ns = 0;
+    double stddev_elapsed_total_ns = 0.0;
+    double mean_prod_ns = 0.0;
+    double stddev_prod_ns = 0.0;
+    double mean_cons_ns = 0.0;
+    double stddev_cons_ns = 0.0;
     double mean_enq_latency_ns = 0.0;
     double stddev_enq_latency_ns = 0.0;
     double mean_enq_full_latency_ns = 0.0;
@@ -271,14 +273,14 @@ void print_benchmark_results(const BenchmarkResult& res)
     std::cout << std::endl;
     print_msg("== Durations ===========================================");
     print_msg(std::format("Total elapsed time: {:<18} [SD: {}]",
-                          round_up_measurement(res.elapsed_total_us, TimeUnit::MICROSECONDS),
-                          round_up_measurement(res.stddev_elapsed_total_us, TimeUnit::MICROSECONDS)));
+                          round_up_measurement(res.elapsed_total_ns, TimeUnit::NANOSECONDS),
+                          round_up_measurement(res.stddev_elapsed_total_ns, TimeUnit::NANOSECONDS)));
     print_msg(std::format("Mean producer time: {:<18} [SD: {}]",
-                          round_up_measurement(res.mean_prod_us, TimeUnit::MICROSECONDS),
-                          round_up_measurement(res.stddev_prod_us, TimeUnit::MICROSECONDS)));
+                          round_up_measurement(res.mean_prod_ns, TimeUnit::NANOSECONDS),
+                          round_up_measurement(res.stddev_prod_ns, TimeUnit::NANOSECONDS)));
     print_msg(std::format("Mean consumer time: {:<18} [SD: {}]",
-                          round_up_measurement(res.mean_cons_us, TimeUnit::MICROSECONDS),
-                          round_up_measurement(res.stddev_cons_us, TimeUnit::MICROSECONDS)));
+                          round_up_measurement(res.mean_cons_ns, TimeUnit::NANOSECONDS),
+                          round_up_measurement(res.stddev_cons_ns, TimeUnit::NANOSECONDS)));
 
     print_msg("== Statistics ==========================================");
     if (!res.enq_count.has_value() || !res.deq_count.has_value())
@@ -297,10 +299,10 @@ void print_benchmark_results(const BenchmarkResult& res)
 
         uint64_t total_ops = res.enq_count.value() + res.deq_count.value();
 
-        print_msg(std::format("Throughput (TOTAL) = {:e} op/s", total_ops / (res.elapsed_total_us / 1'000'000.0f)));
+        print_msg(std::format("Throughput (TOTAL) = {:e} op/s", total_ops / (res.elapsed_total_ns / NS_PER_SEC)));
 
-        double mean_prod_throughput = res.enq_count.value() / (res.mean_prod_us / 1'000'000.0);
-        double mean_cons_throughput = res.deq_count.value() / (res.mean_cons_us / 1'000'000.0);
+        double mean_prod_throughput = res.enq_count.value() / (res.mean_prod_ns / NS_PER_SEC);
+        double mean_cons_throughput = res.deq_count.value() / (res.mean_cons_ns / NS_PER_SEC);
 
         print_msg(std::format(":: Throughput (PROD) = {:e} op/s", mean_prod_throughput));
         print_msg(std::format(":: Throughput (CONS) = {:e} op/s", mean_cons_throughput));
@@ -354,8 +356,8 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
 
     std::vector<std::thread> producers, consumers;
     std::barrier sync_point(params.num_prod + params.num_cons + 1);
-    std::vector<uint64_t> prod_times_us(params.num_prod, 0);
-    std::vector<uint64_t> cons_times_us(params.num_cons, 0);
+    std::vector<uint64_t> prod_times_ns(params.num_prod, 0);
+    std::vector<uint64_t> cons_times_ns(params.num_cons, 0);
 
     if (params.iteration >= 0)
         std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " started." << std::endl;
@@ -376,8 +378,7 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
                     auto start = std::chrono::steady_clock::now();
                     prod_func(prod_idx);
                     auto end = std::chrono::steady_clock::now();
-                    prod_times_us[prod_idx] =
-                        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                    prod_times_ns[prod_idx] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
                 });
             ++prod_idx;
         }
@@ -391,8 +392,7 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
                     auto start = std::chrono::steady_clock::now();
                     cons_func(cons_idx);
                     auto end = std::chrono::steady_clock::now();
-                    cons_times_us[cons_idx] =
-                        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                    cons_times_ns[cons_idx] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
                 });
             ++cons_idx;
         }
@@ -415,22 +415,22 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
         thread.join();
 
     const auto finish{std::chrono::steady_clock::now()};
-    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count();
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start).count();
 
     if (params.iteration >= 0)
         std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " completed." << std::endl;
 
     // Calculate mean producer and consumer times
-    uint64_t total_prod_us = 0;
+    uint64_t total_prod_ns = 0;
     for (uint8_t i = 0; i < params.num_prod; i++)
-        total_prod_us += prod_times_us[i];
+        total_prod_ns += prod_times_ns[i];
 
-    uint64_t total_cons_us = 0;
+    uint64_t total_cons_ns = 0;
     for (uint8_t i = 0; i < params.num_cons; i++)
-        total_cons_us += cons_times_us[i];
+        total_cons_ns += cons_times_ns[i];
 
-    double mean_prod_us = static_cast<double>(total_prod_us) / params.num_prod;
-    double mean_cons_us = static_cast<double>(total_cons_us) / params.num_cons;
+    double mean_prod_ns = static_cast<double>(total_prod_ns) / params.num_prod;
+    double mean_cons_ns = static_cast<double>(total_cons_ns) / params.num_cons;
 
     // Read final enqueue/dequeue counts (updated once per thread at the end)
     uint64_t enq_count = params.enq_counter.load(std::memory_order_relaxed);
@@ -445,9 +445,9 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
     res.enq_count = enq_count != 0 ? std::optional<uint64_t>(enq_count) : std::nullopt;
     res.deq_count = deq_count != 0 ? std::optional<uint64_t>(deq_count) : std::nullopt;
     res.deq_items = params.deq_items;
-    res.elapsed_total_us = elapsed_us;
-    res.mean_prod_us = mean_prod_us;
-    res.mean_cons_us = mean_cons_us;
+    res.elapsed_total_ns = elapsed_ns;
+    res.mean_prod_ns = mean_prod_ns;
+    res.mean_cons_ns = mean_cons_ns;
     res.is_bbq = params.is_bbq;
     res.queue_mode = QUEUE_MODE;
 
@@ -546,16 +546,16 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     std::cout << "Aggregating results from " << results.size() << " iterations..." << std::endl;
 
     // Move data to separate vector arrays to simplify trimming
-    std::vector<double> elapsed_times_us, prod_times_us, cons_times_us;
+    std::vector<double> elapsed_times_ns, prod_times_ns, cons_times_ns;
     std::vector<double> enq_counts, deq_counts;
     std::vector<double> enq_latency_ns, enq_full_latency_ns;
     std::vector<double> deq_latency_ns, deq_empty_latency_ns;
 
     for (const auto& r : results)
     {
-        elapsed_times_us.push_back(r.elapsed_total_us);
-        prod_times_us.push_back(r.mean_prod_us);
-        cons_times_us.push_back(r.mean_cons_us);
+        elapsed_times_ns.push_back(r.elapsed_total_ns);
+        prod_times_ns.push_back(r.mean_prod_ns);
+        cons_times_ns.push_back(r.mean_cons_ns);
 
         if (r.enq_count.has_value())
             enq_counts.push_back(r.enq_count.value());
@@ -572,27 +572,27 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     // Trim the results to remove outliers
     std::cout << "Trimming results by " << (TRIM_PERCENTAGE * 100.0) << "% from both ends to remove outliers..."
               << std::endl;
-    std::size_t size_before_trim = elapsed_times_us.size();
-    trim_vector(elapsed_times_us, TRIM_PERCENTAGE);
-    trim_vector(prod_times_us, TRIM_PERCENTAGE);
-    trim_vector(cons_times_us, TRIM_PERCENTAGE);
+    std::size_t size_before_trim = elapsed_times_ns.size();
+    trim_vector(elapsed_times_ns, TRIM_PERCENTAGE);
+    trim_vector(prod_times_ns, TRIM_PERCENTAGE);
+    trim_vector(cons_times_ns, TRIM_PERCENTAGE);
     trim_vector(enq_counts, TRIM_PERCENTAGE);
     trim_vector(deq_counts, TRIM_PERCENTAGE);
     trim_vector(enq_latency_ns, TRIM_PERCENTAGE);
     trim_vector(enq_full_latency_ns, TRIM_PERCENTAGE);
     trim_vector(deq_latency_ns, TRIM_PERCENTAGE);
     trim_vector(deq_empty_latency_ns, TRIM_PERCENTAGE);
-    std::cout << std::format("Trimmed {}/{} results.", size_before_trim - elapsed_times_us.size(), size_before_trim)
+    std::cout << std::format("Trimmed {}/{} results.", size_before_trim - elapsed_times_ns.size(), size_before_trim)
               << std::endl;
 
     // Calculate the mean of the trimmed results
     BenchmarkResult agg = results.front();
-    agg.elapsed_total_us = calculate_mean(elapsed_times_us);
-    agg.stddev_elapsed_total_us = calculate_std_dev(elapsed_times_us);
-    agg.mean_prod_us = calculate_mean(prod_times_us);
-    agg.stddev_prod_us = calculate_std_dev(prod_times_us);
-    agg.mean_cons_us = calculate_mean(cons_times_us);
-    agg.stddev_cons_us = calculate_std_dev(cons_times_us);
+    agg.elapsed_total_ns = calculate_mean(elapsed_times_ns);
+    agg.stddev_elapsed_total_ns = calculate_std_dev(elapsed_times_ns);
+    agg.mean_prod_ns = calculate_mean(prod_times_ns);
+    agg.stddev_prod_ns = calculate_std_dev(prod_times_ns);
+    agg.mean_cons_ns = calculate_mean(cons_times_ns);
+    agg.stddev_cons_ns = calculate_std_dev(cons_times_ns);
     agg.enq_count = enq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(enq_counts));
     agg.deq_count = deq_counts.empty() ? std::nullopt : std::optional<uint64_t>(calculate_mean(deq_counts));
     agg.mean_enq_latency_ns = calculate_mean(enq_latency_ns);
@@ -2117,12 +2117,12 @@ void export_to_csv(const std::string& filename, const std::vector<BenchmarkResul
         return;
     }
 
-    file << "Label,Producers,Consumers,Threads,Total Elapsed Time (us),Total Elapsed Time (SD),"
-         << "Mean Producer Elapsed Time (us),Producer Elapsed Time (SD),Mean Consumer Elapsed Time (us),"
-         << "Consumer Elapsed Time (SD),Total Throughput (op/s),Mean Producer Throughput (op/s),"
-         << "Mean Consumer Throughput (op/s),Mean Enqueue Latency (ns/op),Mean Enqueue Latency (SD),"
-         << "Mean Enqueue Full Latency (ns/op),Mean Enqueue Full Latency (SD),Mean Dequeue Latency (ns/op),"
-         << "Mean Dequeue Latency (SD),Mean Dequeue Empty Latency (ns),Mean Dequeue Empty Latency (SD)\n";
+    file << "Label,Producers,Consumers,Threads,Total Elapsed Time (ns),Total Elapsed Time [SD],"
+         << "Mean Producer Elapsed Time (ns),Producer Elapsed Time [SD],Mean Consumer Elapsed Time (ns),"
+         << "Consumer Elapsed Time [SD],Total Throughput (op/s),Mean Producer Throughput (op/s),"
+         << "Mean Consumer Throughput (op/s),Mean Enqueue Latency (ns/op),Mean Enqueue Latency [SD],"
+         << "Mean Enqueue Full Latency (ns/op),Mean Enqueue Full Latency [SD],Mean Dequeue Latency (ns/op),"
+         << "Mean Dequeue Latency [SD],Mean Dequeue Empty Latency (ns),Mean Dequeue Empty Latency [SD]\n";
 
     for (const auto& result : results)
     {
@@ -2133,9 +2133,9 @@ void export_to_csv(const std::string& filename, const std::vector<BenchmarkResul
         double cons_throughput = 0.0;
         if (total_ops != 0)
         {
-            total_throughput = total_ops / (result.elapsed_total_us / 1'000'000.0f);
-            prod_throughput = result.enq_count.value() / (result.mean_prod_us / 1'000'000.0f);
-            cons_throughput = result.deq_count.value() / (result.mean_cons_us / 1'000'000.0f);
+            total_throughput = total_ops / (result.elapsed_total_ns / NS_PER_SEC);
+            prod_throughput = result.enq_count.value() / (result.mean_prod_ns / NS_PER_SEC);
+            cons_throughput = result.deq_count.value() / (result.mean_cons_ns / NS_PER_SEC);
         }
 
         // clang-format off
@@ -2143,12 +2143,12 @@ void export_to_csv(const std::string& filename, const std::vector<BenchmarkResul
              << static_cast<int>(result.num_prod) << ","
              << static_cast<int>(result.num_cons) << ","
              << static_cast<int>(result.thread_count) << ","
-             << result.elapsed_total_us << ","
-             << result.stddev_elapsed_total_us << ","
-             << result.mean_prod_us << ","
-             << result.stddev_prod_us << ","
-             << result.mean_cons_us << ","
-             << result.stddev_cons_us << ","
+             << result.elapsed_total_ns << ","
+             << result.stddev_elapsed_total_ns << ","
+             << result.mean_prod_ns << ","
+             << result.stddev_prod_ns << ","
+             << result.mean_cons_ns << ","
+             << result.stddev_cons_ns << ","
              << total_throughput << ","
              << prod_throughput << ","
              << cons_throughput << ","
