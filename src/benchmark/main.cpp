@@ -5,11 +5,15 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -100,11 +104,12 @@ struct BenchmarkResult
     std::string_view label = "UNKNOWN";
     uint8_t num_prod = 0;
     uint8_t num_cons = 0;
+    uint8_t thread_count = 0;
     uint64_t items_per_prod = 0;
     std::optional<uint64_t> enq_count = std::nullopt;
     std::optional<uint64_t> deq_count = std::nullopt;
     std::vector<q_val_t>* deq_items;
-    uint64_t elapsed_total_us = 0;
+    double elapsed_total_us = 0;
     double stddev_elapsed_total_us = 0.0;
     double mean_prod_us = 0.0;
     double stddev_prod_us = 0.0;
@@ -126,7 +131,7 @@ struct BenchmarkResult
 struct BenchmarkParams
 {
     std::string_view label;
-    const uint8_t thread_count;
+    const uint32_t thread_count;
     const uint64_t item_count;
     const uint8_t num_prod;
     const uint8_t num_cons;
@@ -290,9 +295,9 @@ void print_benchmark_results(const BenchmarkResult& res)
             return;
         }
 
-        uint64_t stl_total_ops = res.enq_count.value() + res.deq_count.value();
+        uint64_t total_ops = res.enq_count.value() + res.deq_count.value();
 
-        print_msg(std::format("Throughput (TOTAL) = {:e} op/s", stl_total_ops / (res.elapsed_total_us / 1'000'000.0f)));
+        print_msg(std::format("Throughput (TOTAL) = {:e} op/s", total_ops / (res.elapsed_total_us / 1'000'000.0f)));
 
         double mean_prod_throughput = res.enq_count.value() / (res.mean_prod_us / 1'000'000.0);
         double mean_cons_throughput = res.deq_count.value() / (res.mean_cons_us / 1'000'000.0);
@@ -356,9 +361,9 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
         std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " started." << std::endl;
 
     // Start producer and consumer threads
-    uint8_t prod_idx = 0, cons_idx = 0;
-    uint8_t total_threads = params.num_prod + params.num_cons;
-    for (uint8_t t = 0; t < total_threads; ++t)
+    uint32_t prod_idx = 0, cons_idx = 0;
+    uint32_t total_threads = params.num_prod + params.num_cons;
+    for (uint32_t t = 0; t < total_threads; ++t)
     {
         // Alternate between producer and consumer threads, starting with a producer on CPU 0.
         if ((t % 2 == 0 && prod_idx < params.num_prod) || cons_idx >= params.num_cons) // Producer
@@ -435,6 +440,7 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
     res.label = params.label;
     res.num_prod = params.num_prod;
     res.num_cons = params.num_cons;
+    res.thread_count = std::min(static_cast<unsigned int>(params.thread_count), std::thread::hardware_concurrency());
     res.items_per_prod = params.item_count / params.num_prod;
     res.enq_count = enq_count != 0 ? std::optional<uint64_t>(enq_count) : std::nullopt;
     res.deq_count = deq_count != 0 ? std::optional<uint64_t>(deq_count) : std::nullopt;
@@ -540,10 +546,10 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
     std::cout << "Aggregating results from " << results.size() << " iterations..." << std::endl;
 
     // Move data to separate vector arrays to simplify trimming
-    std::vector<uint64_t> elapsed_times_us, prod_times_us, cons_times_us;
-    std::vector<uint64_t> enq_counts, deq_counts;
-    std::vector<uint64_t> enq_latency_ns, enq_full_latency_ns;
-    std::vector<uint64_t> deq_latency_ns, deq_empty_latency_ns;
+    std::vector<double> elapsed_times_us, prod_times_us, cons_times_us;
+    std::vector<double> enq_counts, deq_counts;
+    std::vector<double> enq_latency_ns, enq_full_latency_ns;
+    std::vector<double> deq_latency_ns, deq_empty_latency_ns;
 
     for (const auto& r : results)
     {
@@ -581,7 +587,7 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
 
     // Calculate the mean of the trimmed results
     BenchmarkResult agg = results.front();
-    agg.elapsed_total_us = static_cast<uint64_t>(calculate_mean(elapsed_times_us));
+    agg.elapsed_total_us = calculate_mean(elapsed_times_us);
     agg.stddev_elapsed_total_us = calculate_std_dev(elapsed_times_us);
     agg.mean_prod_us = calculate_mean(prod_times_us);
     agg.stddev_prod_us = calculate_std_dev(prod_times_us);
@@ -603,7 +609,7 @@ BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
 
 // Note: This is based on the simple SPSC benchmark outlined in the academic paper.
 // The main purpose of this benchmark is to determine the raw performance of the queue.
-void run_simple_benchmark(const uint32_t iters, const uint8_t thread_count)
+BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread_count)
 {
     std::atomic<uint64_t> enq_counter{0};
     std::atomic<uint64_t> deq_counter{0};
@@ -701,10 +707,11 @@ void run_simple_benchmark(const uint32_t iters, const uint8_t thread_count)
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 
-void run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                           const uint8_t thread_count)
+BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
+                                      const uint32_t thread_count)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -967,10 +974,11 @@ void run_complex_benchmark(const uint8_t num_prod, const uint8_t num_cons, const
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 
-void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                             const uint8_t thread_count)
+BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
+                                        const uint32_t thread_count)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -1122,12 +1130,13 @@ void run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, con
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 
 // Based on example from Boost documentation:
 // https://www.boost.org/doc/libs/master/doc/html/lockfree/examples.html
-void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                                        const uint8_t thread_count, bool disable_optimized_spsc = false)
+BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
+                                                   const uint32_t thread_count, bool disable_optimized_spsc = false)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -1439,11 +1448,12 @@ void run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t nu
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 
 // https://www.boost.org/doc/libs/1_88_0/doc/html/thread/sds.html
-void run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                                            const uint8_t thread_count)
+BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons,
+                                                       const uint32_t iters, const uint32_t thread_count)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -1644,11 +1654,12 @@ void run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, const uint8_
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 
 #ifdef ENABLE_FOLLY_BENCHMARKS
-void run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
-                          const uint8_t thread_count, bool disable_optimized_spsc = false)
+BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
+                                     const uint32_t thread_count, bool disable_optimized_spsc = false)
 {
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> enq_counter{0};
     alignas(CACHELINE_SIZE) std::atomic<uint64_t> deq_counter{0};
@@ -1990,6 +2001,7 @@ void run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_cons, const 
 
     auto aggr = aggregate_results(results);
     print_benchmark_results(aggr);
+    return aggr;
 }
 #endif
 
@@ -2024,6 +2036,55 @@ bool parse_arg(int argc, char** argv, int& i, T& out, T min_val = 1, T max_val =
     return false;
 }
 
+/// @brief A structure to hold range specifications for command line arguments.
+/// @note Used for the producer and consumer arguments.
+struct RangeSpec
+{
+    /// @brief The start value of the range.
+    uint8_t start = 1;
+
+    /// @brief The end value of the range. (Optional)
+    uint8_t max = 1;
+
+    /// @brief The step value for the range. (Optional)
+    uint8_t step = 1;
+};
+
+bool parse_range_arg(std::string_view arg, RangeSpec& out)
+{
+    std::vector<std::string> parts;
+    size_t pos = 0;
+
+    while ((pos = arg.find(':')) != std::string_view::npos)
+    {
+        parts.push_back(std::string(arg.substr(0, pos)));
+        arg.remove_prefix(pos + 1);
+    }
+    parts.push_back(std::string(arg));
+
+    if (parts.empty() || parts.size() > 3)
+        return false;
+
+    for (const auto& part : parts)
+        if (part.empty() || !std::isdigit(static_cast<unsigned char>(part[0])))
+            return false;
+
+    out.start = static_cast<uint8_t>(std::atoi(parts[0].c_str()));
+
+    // Process optional max and step values
+    if (parts.size() > 1)
+        out.max = static_cast<uint8_t>(std::atoi(parts[1].c_str()));
+    else
+        out.max = out.start; // Default to start if max is not provided
+
+    if (parts.size() > 2)
+        out.step = static_cast<uint8_t>(std::atoi(parts[2].c_str()));
+    else
+        out.step = 1; // Default step value
+
+    return true;
+}
+
 TestMode parse_mode(const std::string& mode)
 {
     std::string lower_mode = mode;
@@ -2045,6 +2106,65 @@ TestMode parse_mode(const std::string& mode)
 #endif
 
     return TestMode::UNKNOWN;
+}
+
+void export_to_csv(const std::string& filename, const std::vector<BenchmarkResult>& results)
+{
+    std::ofstream file(filename);
+    if (!file.is_open())
+    {
+        std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
+        return;
+    }
+
+    file << "Label,Producers,Consumers,Threads,Total Elapsed Time (us),Total Elapsed Time (SD),"
+         << "Mean Producer Elapsed Time (us),Producer Elapsed Time (SD),Mean Consumer Elapsed Time (us),"
+         << "Consumer Elapsed Time (SD),Total Throughput (op/s),Mean Producer Throughput (op/s),"
+         << "Mean Consumer Throughput (op/s),Mean Enqueue Latency (ns/op),Mean Enqueue Latency (SD),"
+         << "Mean Enqueue Full Latency (ns/op),Mean Enqueue Full Latency (SD),Mean Dequeue Latency (ns/op),"
+         << "Mean Dequeue Latency (SD),Mean Dequeue Empty Latency (ns),Mean Dequeue Empty Latency (SD)\n";
+
+    for (const auto& result : results)
+    {
+        uint64_t total_ops = result.enq_count.value() + result.deq_count.value();
+
+        double total_throughput = 0.0;
+        double prod_throughput = 0.0;
+        double cons_throughput = 0.0;
+        if (total_ops != 0)
+        {
+            total_throughput = total_ops / (result.elapsed_total_us / 1'000'000.0f);
+            prod_throughput = result.enq_count.value() / (result.mean_prod_us / 1'000'000.0f);
+            cons_throughput = result.deq_count.value() / (result.mean_cons_us / 1'000'000.0f);
+        }
+
+        // clang-format off
+        file << result.label << ","
+             << static_cast<int>(result.num_prod) << ","
+             << static_cast<int>(result.num_cons) << ","
+             << static_cast<int>(result.thread_count) << ","
+             << result.elapsed_total_us << ","
+             << result.stddev_elapsed_total_us << ","
+             << result.mean_prod_us << ","
+             << result.stddev_prod_us << ","
+             << result.mean_cons_us << ","
+             << result.stddev_cons_us << ","
+             << total_throughput << ","
+             << prod_throughput << ","
+             << cons_throughput << ","
+             << result.mean_enq_latency_ns << ","
+             << result.stddev_enq_latency_ns << ","
+             << result.mean_enq_full_latency_ns << ","
+             << result.stddev_enq_full_latency_ns << ","
+             << result.mean_deq_latency_ns << ","
+             << result.stddev_deq_latency_ns << ","
+             << result.mean_deq_empty_latency_ns << ","
+             << result.stddev_deq_empty_latency_ns << "\n";
+        // clang-format on
+    }
+
+    file.close();
+    std::cout << "Benchmark results exported to " << filename << std::endl;
 }
 
 // clang-format off
@@ -2069,26 +2189,35 @@ void print_help(const std::string& program_name)
     #endif
     std::cout << std::endl << "Options:" << std::endl;
     std::cout << "    -h, --help                 Show this help message.\n" << std::endl;
-    std::cout << "    -p <N>, --producers <N>    Set the number of producers (default: 1)." << std::endl;
-    std::cout << "    -c <N>, --consumers <N>    Set the number of consumers (default: 1)." << std::endl;
+    std::cout << "    -p <N[:m[:st]]>,           Set the number of producers (default: 1)." << std::endl;
+    std::cout << "    --producers <N[:m[:st]]>   You can provide optional max value and" << std::endl;
+    std::cout << "                               step value to define a range of producers." << std::endl;
+    std::cout << "    -c <N[:m[:st]]>,           Set the number of consumers (default: 1)." << std::endl;
+    std::cout << "    --consumers <N[:m[:st]]>   You can provide optional max value and" << std::endl;
+    std::cout << "                               step value to define a range of consumers." << std::endl;
     std::cout << "    -i <N>, --iterations <N>   Set the number of iterations to run (default: 1)." << std::endl;
     std::cout << "    -t <N>, --threads <N>      Set the number of threads to use (default: 2)." << std::endl;
     std::cout << "    --disable-optimized-spsc   Disable the use of SPSC queue variants." << std::endl;
     std::cout << "                               Some libraries offer faster SPSC queue data" << std::endl;
     std::cout << "                               structures, which may skew results." << std::endl;
     std::cout << "                               Use this option to disable their use." << std::endl;
+    std::cout << "    -o <path>, --output <path> Export benchmark results to a CSV file at target path." << std::endl;
+    std::cout << "                               If not specified, results are only printed to stdout." << std::endl;
 }
 // clang-format on
 
 int main(int argc, char** argv)
 {
     std::string benchmark_mode;
-    uint8_t num_prod = 1;
-    uint8_t num_cons = 1;
+    RangeSpec prod_range{1, 1, 1};
+    RangeSpec cons_range{1, 1, 1};
     uint32_t num_iter = 1;
-    uint8_t num_threads = 2;
+    uint32_t num_threads = -1;
+    bool explicit_thread_count = false;
     bool show_help = false;
     bool disable_optimized_spsc = false;
+    std::string output_file_path = "";
+    bool export_results = false;
 
     // Parse command line args
     // Note(s):
@@ -2103,30 +2232,30 @@ int main(int argc, char** argv)
         }
         else if (arg == "-p" || arg == "--producers")
         {
-            if (!parse_arg(argc, argv, i, num_prod))
+            if (!parse_range_arg(argv[++i], prod_range))
             {
                 std::cerr << "Error: Invalid number of producers specified." << std::endl;
                 return 1;
             }
 
-            if (num_prod == 0)
+            if (prod_range.start == 0 || prod_range.max == 0 || prod_range.step == 0)
             {
                 std::cout << "Warning: Number of producers set to 0. Defaulting to 1." << std::endl;
-                num_prod = 1; // Ensure at least one producer
+                prod_range = RangeSpec{1, 1, 1}; // Reset to default values
             }
         }
         else if (arg == "-c" || arg == "--consumers")
         {
-            if (!parse_arg(argc, argv, i, num_cons))
+            if (!parse_range_arg(argv[++i], cons_range))
             {
                 std::cerr << "Error: Invalid number of consumers specified." << std::endl;
                 return 1;
             }
 
-            if (num_cons == 0)
+            if (cons_range.start == 0 || cons_range.max == 0 || cons_range.step == 0)
             {
                 std::cout << "Warning: Number of consumers set to 0. Defaulting to 1." << std::endl;
-                num_cons = 1; // Ensure at least one consumer
+                cons_range = RangeSpec{1, 1, 1}; // Reset to default values
             }
         }
         else if (arg == "-i" || arg == "--iterations")
@@ -2145,8 +2274,8 @@ int main(int argc, char** argv)
         }
         else if (arg == "-t" || arg == "--threads")
         {
-            if (!parse_arg(argc, argv, i, num_threads, static_cast<uint8_t>(1),
-                           static_cast<uint8_t>(std::thread::hardware_concurrency())))
+            if (!parse_arg(argc, argv, i, num_threads, static_cast<uint32_t>(1),
+                           static_cast<uint32_t>(std::thread::hardware_concurrency())))
             {
                 std::cerr << "Error: Invalid number of threads specified." << std::endl;
                 return 1;
@@ -2162,10 +2291,39 @@ int main(int argc, char** argv)
                 std::cout << "Warning: Number of threads exceeds hardware concurrency. "
                           << "Limiting to " << std::thread::hardware_concurrency() << "." << std::endl;
             }
+
+            bool explicit_thread_count = true; // User explicitly set the thread count
         }
         else if (arg == "--disable-optimized-spsc")
         {
             disable_optimized_spsc = true;
+        }
+        else if (arg == "-o" || arg == "--output")
+        {
+            if (i + 1 < argc)
+            {
+                std::filesystem::path output_path(argv[++i]);
+
+                // Validate the output path
+                if (!output_file_path.empty() &&
+                    (!std::filesystem::exists(output_path) || !std::filesystem::is_directory(output_path)))
+                {
+                    std::cerr << "Error: Output file path does not exist: " << output_path << std::endl;
+                    return 1;
+                }
+
+                // Ensure the output path ends with a separator
+                output_file_path = output_path.string();
+                if (!output_file_path.empty() && output_file_path.back() != std::filesystem::path::preferred_separator)
+                    output_file_path += std::filesystem::path::preferred_separator;
+
+                export_results = true;
+            }
+            else
+            {
+                std::cerr << "Error: No output file path specified." << std::endl;
+                return 1;
+            }
         }
         else
         {
@@ -2179,31 +2337,77 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    switch (parse_mode(benchmark_mode))
+    std::vector<BenchmarkResult> results;
+    results.reserve(prod_range.max * cons_range.max);
+
+    for (uint8_t p = prod_range.start; p <= prod_range.max; p += prod_range.step)
     {
-        case TestMode::SIMPLE:
-            run_simple_benchmark(num_iter, num_threads);
-            break;
-        case TestMode::COMPLEX:
-            run_complex_benchmark(num_prod, num_cons, num_iter, num_threads);
-            break;
-        case TestMode::STL:
-            run_stl_queue_benchmark(num_prod, num_cons, num_iter, num_threads);
-            break;
-        case TestMode::BOOST_LFQ:
-            run_boost_lockfree_queue_benchmark(num_prod, num_cons, num_iter, num_threads, disable_optimized_spsc);
-            break;
-        case TestMode::BOOST_SYNC_BOUNDED:
-            run_boost_sync_bounded_queue_benchmark(num_prod, num_cons, num_iter, num_threads);
-            break;
+        for (uint8_t c = cons_range.start; c <= cons_range.max; c += cons_range.step)
+        {
+            // If the user hasn't set a number of threads, default to a value that covers
+            // all producers and consumers.
+            if (!explicit_thread_count)
+            {
+                num_threads = std::min(static_cast<unsigned int>(p + c), std::thread::hardware_concurrency());
+                std::cout << "Using " << num_threads << " threads for " << static_cast<int>(p) << " producers and "
+                          << static_cast<int>(c) << " consumers." << std::endl;
+            }
+
+            if (num_threads < p + c)
+                std::cout << "Warning: Thread oversubscription detected.\n"
+                             "Multiple producers/consumers will share threads. Expect reduced performance.\n"
+                             "Target thread count: "
+                          << num_threads << std::endl;
+
+            if (num_threads > std::thread::hardware_concurrency())
+                std::cout << "Warning: Target thread count exceeds hardware concurrency. "
+                          << "Limiting to " << std::thread::hardware_concurrency() << "." << std::endl;
+
+            switch (parse_mode(benchmark_mode))
+            {
+                case TestMode::SIMPLE:
+                    results.emplace_back(run_simple_benchmark(num_iter, num_threads));
+                    break;
+                case TestMode::COMPLEX:
+                    results.emplace_back(run_complex_benchmark(p, c, num_iter, num_threads));
+                    break;
+                case TestMode::STL:
+                    results.emplace_back(run_stl_queue_benchmark(p, c, num_iter, num_threads));
+                    break;
+                case TestMode::BOOST_LFQ:
+                    results.emplace_back(
+                        run_boost_lockfree_queue_benchmark(p, c, num_iter, num_threads, disable_optimized_spsc));
+                    break;
+                case TestMode::BOOST_SYNC_BOUNDED:
+                    results.emplace_back(run_boost_sync_bounded_queue_benchmark(p, c, num_iter, num_threads));
+                    break;
 #ifdef ENABLE_FOLLY_BENCHMARKS
-        case TestMode::FOLLYQ:
-            run_follyq_benchmark(num_prod, num_cons, num_iter, num_threads, disable_optimized_spsc);
-            break;
+                case TestMode::FOLLYQ:
+                    results.emplace_back(run_follyq_benchmark(p, c, num_iter, num_threads, disable_optimized_spsc));
+                    break;
 #endif
-        default:
-            std::cerr << "Unknown mode provided: " << argv[1] << std::endl;
-            return 1;
+                default:
+                    std::cerr << "Unknown mode provided: " << argv[1] << std::endl;
+                    return 1;
+            }
+        }
+    }
+
+    // Export results to CSV
+    if (export_results)
+    {
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        const auto local_time = std::localtime(&now);
+
+        std::string mode_suffix = "_" + benchmark_mode;
+        if (benchmark_mode == "simple" || benchmark_mode == "complex")
+            mode_suffix += QUEUE_MODE == queues::QueueMode::RETRY_NEW ? "_rn" : "_do";
+
+        std::ostringstream oss;
+        oss << "benchmark_results_" << std::put_time(local_time, "%Y-%m-%d-%H-%M") << mode_suffix << ".csv";
+        std::string csv_filename = oss.str();
+
+        export_to_csv(output_file_path + csv_filename, results);
     }
 
     return 0;
