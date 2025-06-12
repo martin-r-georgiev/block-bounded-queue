@@ -1,9 +1,9 @@
 #include <queue/bbq.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <format>
@@ -11,13 +11,13 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <mutex>
 #include <numeric>
 #include <queue>
 #include <sstream>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <vector>
 
 #include <boost/lockfree/queue.hpp>
@@ -55,6 +55,10 @@ constexpr queues::QueueMode QUEUE_MODE = queues::QueueMode::RETRY_NEW;
 // Do additional correctness checks in benchmarks; Slows down the benchmarks significantly
 #ifndef CORR_CHECKS
     #define CORR_CHECKS 0
+#endif
+
+#if CORR_CHECKS
+    #include <unordered_set>
 #endif
 
 // Percentage of results to trim from both ends
@@ -156,7 +160,8 @@ struct BenchmarkParams
     std::vector<q_val_t>* deq_items = nullptr;
     std::atomic<bool>* producers_done = nullptr;
     bool is_bbq = false;
-    int iteration = -1;
+    uint32_t curr_iter = -1;  // Used only for printing
+    uint32_t total_iters = 1; // Used only for printing
 };
 
 enum class TimeUnit : uint8_t
@@ -208,45 +213,68 @@ std::string round_up_measurement(T val, TimeUnit val_unit, std::string_view suff
         return std::format("{:.4f} {}{}", calculation, time_unit_to_string(val_unit), suffix);
 }
 
+// Source: https://gist.github.com/JBlond/2fea43a3049b38287e5e9cefc87b2124#file-bash-colors-md
+constexpr char ANSI_CLR_RESET[] = "\033[0m";
+constexpr char ANSI_CLR_GREEN[] = "\033[1;32m";
+constexpr char ANSI_CLR_BRIGHT_BLACK[] = "\033[1;30m";
+constexpr char ANSI_CLR_BOLD_WHITE[] = "\033[1;37m";
+constexpr char PROG_BAR_CHAR[] = "▪";
+constexpr int PROG_BAR_WIDTH = 32;
+
+/// @brief Displays a progress bar in the terminal.
+/// @remark Based on the following implementation: https://stackoverflow.com/a/14539953
+void display_progress_bar(const size_t current, size_t total, std::string_view prefix = "", int width = 40)
+{
+    if (total == 0)
+        total = 1;
+
+    const float progress = static_cast<float>(current) / total;
+    const int pos = static_cast<int>(width * progress);
+
+    std::cout << "\r" << prefix << " " << ANSI_CLR_GREEN;
+    for (int i = 0; i < width; ++i)
+        if (i < pos)
+            std::cout << PROG_BAR_CHAR;
+        else
+            std::cout << ANSI_CLR_BRIGHT_BLACK << PROG_BAR_CHAR;
+
+    std::cout << ANSI_CLR_RESET << std::format(" {:<6.1f}% ({}/{})", progress * 100.0, current, total) << std::flush;
+
+    if (current == total)
+        std::cout << std::endl;
+}
+
 /// @brief Pretty-prints the (aggregate) benchmark results to the console.
 /// @param res The set of benchmark results to print.
 void print_benchmark_results(const BenchmarkResult& res)
 {
-    auto print_msg = [&](const std::string& msg) { std::cout << "[" << res.label << "] " << msg << std::endl; };
+    auto print_msg = [&](const std::string& msg, const char* ansi_color = ANSI_CLR_RESET)
+    { std::cout << "[" << res.label << "] " << ansi_color << msg << ANSI_CLR_RESET << std::endl; };
     auto print_err = [&](const std::string& msg) { std::cerr << "[" << res.label << "] " << msg << std::endl; };
 
     uint64_t total_items = res.num_prod * res.items_per_prod;
 
     std::cout << std::endl;
-    print_msg("========================================================");
-    print_msg(" Benchmark Results (Avg.)");
-    print_msg("========================================================");
+    print_msg("========================================================", ANSI_CLR_BOLD_WHITE);
+    print_msg(" Benchmark Results (Avg.)", ANSI_CLR_BOLD_WHITE);
+    print_msg("========================================================", ANSI_CLR_BOLD_WHITE);
     std::cout << std::endl;
-    print_msg("== Information =========================================");
-    print_msg(std::format("Number of producers: {}", res.num_prod));
-    print_msg(std::format("Number of consumers: {}", res.num_cons));
-    print_msg(std::format("Items per producer: {}. Total items: {}", res.items_per_prod, total_items));
+    print_msg("== Summary =============================================", ANSI_CLR_BOLD_WHITE);
+    print_msg(std::format("Producers: {} | Consumers: {} | Threads: {}", res.num_prod, res.num_cons, res.thread_count));
+    print_msg(
+        std::format(std::locale(""), "Enqueued items: {:L} ({:L} per producer)", total_items, res.items_per_prod));
     if (res.is_bbq)
         print_msg(
             std::format("Queue mode: {}", res.queue_mode == queues::QueueMode::DROP_OLD ? "DROP OLD" : "RETRY NEW"));
-
-    std::cout << std::endl;
-    print_msg("== Acronyms ===========================================");
-    print_msg("SD: Standard Deviation");
-    print_msg("ENQ: Enqueue operation");
-    print_msg("DEQ: Dequeue operation");
-    print_msg("OK: Operation completed successfully");
-    print_msg("FULL: Operation failed due to full queue");
-    print_msg("EMPTY: Operation failed due to empty queue");
 
     // Show correctness information only where applicable
     if (!res.is_bbq || (res.is_bbq && res.queue_mode == queues::QueueMode::RETRY_NEW))
     {
         std::cout << std::endl;
-        print_msg("== Correctness =========================================");
-        print_msg(std::format("Expected items: {}", total_items));
-        print_msg(
-            std::format("Actual(ENQ): {} | Actual(DEQ): {}", res.enq_count.value_or(0), res.deq_count.value_or(0)));
+        print_msg("== Correctness =========================================", ANSI_CLR_BOLD_WHITE);
+        print_msg(std::format(std::locale(""), "Expected items: {:L}", total_items));
+        print_msg(std::format(std::locale(""), "Actual(ENQ): {:L} | Actual(DEQ): {:L}", res.enq_count.value_or(0),
+                              res.deq_count.value_or(0)));
 
         if (res.enq_count == res.deq_count)
             print_msg("Success: Matching enqueued and dequeued item counts.");
@@ -288,18 +316,16 @@ void print_benchmark_results(const BenchmarkResult& res)
     }
 
     std::cout << std::endl;
-    print_msg("== Durations ===========================================");
-    print_msg(std::format("Total elapsed time: {:<18} [SD: {}]",
+    print_msg("== Statistics ==========================================", ANSI_CLR_BOLD_WHITE);
+    print_msg("Elapsed time (MEAN [SD]):");
+    print_msg(std::format(":: Total:       {:<14} [{}]",
                           round_up_measurement(res.elapsed_total_ns, TimeUnit::NANOSECONDS),
                           round_up_measurement(res.stddev_elapsed_total_ns, TimeUnit::NANOSECONDS)));
-    print_msg(std::format("Mean producer time: {:<18} [SD: {}]",
-                          round_up_measurement(res.mean_prod_ns, TimeUnit::NANOSECONDS),
+    print_msg(std::format(":: Producer(s): {:<14} [{}]", round_up_measurement(res.mean_prod_ns, TimeUnit::NANOSECONDS),
                           round_up_measurement(res.stddev_prod_ns, TimeUnit::NANOSECONDS)));
-    print_msg(std::format("Mean consumer time: {:<18} [SD: {}]",
-                          round_up_measurement(res.mean_cons_ns, TimeUnit::NANOSECONDS),
+    print_msg(std::format(":: Consumer(s): {:<14} [{}]", round_up_measurement(res.mean_cons_ns, TimeUnit::NANOSECONDS),
                           round_up_measurement(res.stddev_cons_ns, TimeUnit::NANOSECONDS)));
 
-    print_msg("== Statistics ==========================================");
     if (!res.enq_count.has_value() || !res.deq_count.has_value())
     {
         print_err("Warning: Enqueue and dequeue counts are not available for throughput calculation!");
@@ -314,18 +340,19 @@ void print_benchmark_results(const BenchmarkResult& res)
             return;
         }
 
-        uint64_t total_ops = res.enq_count.value() + res.deq_count.value();
+        print_msg("Throughput (MEAN):");
 
-        print_msg(std::format("Throughput (TOTAL) = {:e} op/s", total_ops / (res.elapsed_total_ns / NS_PER_SEC)));
+        print_msg(std::format(":: Total:        {:e} op/s",
+                              (res.enq_count.value() + res.deq_count.value()) / (res.elapsed_total_ns / NS_PER_SEC)));
 
         double mean_prod_throughput = res.enq_count.value() / (res.mean_prod_ns / NS_PER_SEC);
         double mean_cons_throughput = res.deq_count.value() / (res.mean_cons_ns / NS_PER_SEC);
 
-        print_msg(std::format(":: Throughput (PROD) = {:e} op/s", mean_prod_throughput));
-        print_msg(std::format(":: Throughput (CONS) = {:e} op/s", mean_cons_throughput));
+        print_msg(std::format(":: Producer(s):  {:e} op/s", mean_prod_throughput));
+        print_msg(std::format(":: Consumer(s):  {:e} op/s", mean_cons_throughput));
         print_msg(
-            std::format(":: Fairness (MAX/MIN) = {:.6f}", std::max(mean_prod_throughput, mean_cons_throughput) /
-                                                              std::min(mean_prod_throughput, mean_cons_throughput)));
+            std::format(":: Fairness (MAX/MIN): {:.6f}", std::max(mean_prod_throughput, mean_cons_throughput) /
+                                                             std::min(mean_prod_throughput, mean_cons_throughput)));
     }
 
     if (res.mean_enq_latency_ns == 0.0 || res.mean_deq_latency_ns == 0.0)
@@ -335,16 +362,17 @@ void print_benchmark_results(const BenchmarkResult& res)
     }
     else
     {
-        print_msg(std::format("Mean ENQ latency (OK):    {:<14} [SD: {}]",
+        print_msg("Latencies (MEAN [SD]):");
+        print_msg(std::format(":: ENQ (OK):    {:<14} [{}]",
                               round_up_measurement(res.mean_enq_latency_ns, TimeUnit::NANOSECONDS, "/op"),
                               round_up_measurement(res.stddev_enq_latency_ns, TimeUnit::NANOSECONDS, "/op")));
-        print_msg(std::format("Mean ENQ latency (FULL):  {:<14} [SD: {}]",
+        print_msg(std::format(":: ENQ (FULL):  {:<14} [{}]",
                               round_up_measurement(res.mean_enq_full_latency_ns, TimeUnit::NANOSECONDS, "/op"),
                               round_up_measurement(res.stddev_enq_full_latency_ns, TimeUnit::NANOSECONDS, "/op")));
-        print_msg(std::format("Mean DEQ latency (OK):    {:<14} [SD: {}]",
+        print_msg(std::format(":: DEQ (OK):    {:<14} [{}]",
                               round_up_measurement(res.mean_deq_latency_ns, TimeUnit::NANOSECONDS, "/op"),
                               round_up_measurement(res.stddev_deq_latency_ns, TimeUnit::NANOSECONDS, "/op")));
-        print_msg(std::format("Mean DEQ latency (EMPTY): {:<14} [SD: {}]",
+        print_msg(std::format(":: DEQ (EMPTY): {:<14} [{}]",
                               round_up_measurement(res.mean_deq_empty_latency_ns, TimeUnit::NANOSECONDS, "/op"),
                               round_up_measurement(res.stddev_deq_empty_latency_ns, TimeUnit::NANOSECONDS, "/op")));
     }
@@ -451,8 +479,8 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
     std::vector<uint64_t> prod_times_ns(params.num_prod, 0);
     std::vector<uint64_t> cons_times_ns(params.num_cons, 0);
 
-    if (params.iteration >= 0)
-        std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " started." << std::endl;
+    if (params.curr_iter != -1 && params.total_iters != -1)
+        display_progress_bar(params.curr_iter, params.total_iters, "Progress", PROG_BAR_WIDTH);
 
     // Start producer and consumer threads
     uint32_t prod_idx = 0, cons_idx = 0;
@@ -509,8 +537,8 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
     const auto finish{std::chrono::steady_clock::now()};
     const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start).count();
 
-    if (params.iteration >= 0)
-        std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " completed." << std::endl;
+    if (params.curr_iter != -1 && params.total_iters != -1)
+        display_progress_bar(params.curr_iter + 1, params.total_iters, "Progress", PROG_BAR_WIDTH);
 
     // Calculate mean producer and consumer times
     double mean_prod_ns = calculate_mean(prod_times_ns);
@@ -546,6 +574,7 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
  */
 BenchmarkResult aggregate_results(const std::vector<BenchmarkResult>& results)
 {
+
     if (results.empty())
     {
         std::cerr << "Error: No results to aggregate." << std::endl;
@@ -642,9 +671,10 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
                            .deq_items = nullptr,
                            .producers_done = &producer_done,
                            .is_bbq = true,
-                           .iteration = -1};
+                           .total_iters = iters};
 
-    std::cout << "[SMPL] == Logs ================================================" << std::endl;
+    std::cout << "[SMPL] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
@@ -652,7 +682,7 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
     {
         queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
         producer_done.store(false, std::memory_order_release);
-        params.iteration = i;
+        params.curr_iter = i;
 
         res = run_benchmark(
             params,
@@ -738,10 +768,11 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
                            .deq_items = &deq_items,
                            .producers_done = &producers_done,
                            .is_bbq = true,
-                           .iteration = -1};
+                           .total_iters = iters};
 
-    std::cout << "[CPLX] == Logs ================================================" << std::endl;
-    std::cout << "[CPLX] Running throughput benchmarks..." << std::endl;
+    std::cout << "[CPLX] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
+    std::cout << "Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
@@ -752,7 +783,7 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         res = run_benchmark(
             params,
@@ -808,7 +839,7 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "[CPLX] Running latency benchmarks..." << std::endl;
+    std::cout << "Running latency benchmarks..." << std::endl;
 
     std::mutex op_lat_mutex;
     std::mutex op_lat_full_mutex;
@@ -828,7 +859,7 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
         std::vector<uint64_t> deq_latencies_empty_ns;
         deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         run_benchmark(
             params,
@@ -947,10 +978,11 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
                            .deq_counter = deq_counter,
                            .deq_items = nullptr,
                            .producers_done = nullptr,
-                           .iteration = -1};
+                           .total_iters = iters};
 
-    std::cout << "[STL] == Logs ================================================" << std::endl;
-    std::cout << "[STL] Running throughput benchmarks..." << std::endl;
+    std::cout << "[STL] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
+    std::cout << "Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
@@ -960,7 +992,7 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         res = run_benchmark(
             params,
@@ -1003,7 +1035,7 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "[STL] Running latency benchmarks..." << std::endl;
+    std::cout << "Running latency benchmarks..." << std::endl;
 
     std::mutex op_lat_mutex;
     std::mutex op_lat_full_mutex;
@@ -1020,7 +1052,7 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
         std::vector<uint64_t> deq_latencies_empty_ns;
         deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         run_benchmark(
             params,
@@ -1126,7 +1158,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                            .deq_items = nullptr,
 #endif
                            .producers_done = &producers_done,
-                           .iteration = -1};
+                           .total_iters = iters};
 
     // Note(s):
     // - Boost::lockfree: freelist size is limited to a maximum of 65535 objects.
@@ -1136,7 +1168,8 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
     constexpr std::size_t Q_CAPACITY = std::min(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK,
                                                 static_cast<uint64_t>(std::numeric_limits<uint16_t>::max() - 1));
 
-    std::cout << "[BST-LFQ] == Logs ================================================" << std::endl;
+    std::cout << "[BST-LFQ] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
 
     if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         std::cout << "[BST-LFQ] Using wait-free single-producer/single-consumer (SPSC) queue." << std::endl;
@@ -1153,7 +1186,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
@@ -1278,7 +1311,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
         std::vector<uint64_t> deq_latencies_empty_ns;
         deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
@@ -1482,9 +1515,10 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                            .deq_items = nullptr,
 #endif
                            .producers_done = &producers_done,
-                           .iteration = -1};
+                           .total_iters = iters};
 
-    std::cout << "[BST-BSYNCQ] == Logs ================================================" << std::endl;
+    std::cout << "[BST-BSYNCQ] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
     std::cout << "[BST-BSYNCQ] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
@@ -1495,7 +1529,7 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
 
@@ -1581,7 +1615,7 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
         std::vector<uint64_t> deq_latencies_empty_ns;
         deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
 
@@ -1709,9 +1743,10 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                            .deq_items = nullptr,
     #endif
                            .producers_done = &producers_done,
-                           .iteration = -1};
+                           .total_iters = iters};
 
-    std::cout << "[FOLLYQ] == Logs ================================================" << std::endl;
+    std::cout << "[FOLLYQ] " << ANSI_CLR_BOLD_WHITE
+              << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
 
     if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         std::cout << "[FOLLYQ] Using single-producer/single-consumer ProducerConsumerQueue." << std::endl;
@@ -1728,7 +1763,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
@@ -1878,7 +1913,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
         std::vector<uint64_t> deq_latencies_empty_ns;
         deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
 
-        params.iteration = i;
+        params.curr_iter = i;
 
         if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
         {
@@ -2387,11 +2422,7 @@ int main(int argc, char** argv)
             // If the user hasn't set a number of threads, default to a value that covers
             // all producers and consumers.
             if (!explicit_thread_count)
-            {
                 num_threads = std::min(static_cast<unsigned int>(p + c), std::thread::hardware_concurrency());
-                std::cout << "Using " << num_threads << " threads for " << static_cast<int>(p) << " producers and "
-                          << static_cast<int>(c) << " consumers." << std::endl;
-            }
 
             if (num_threads < p + c)
                 std::cout << "Warning: Thread oversubscription detected.\n"
