@@ -6,6 +6,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -28,6 +29,17 @@
     #include <folly/ProducerConsumerQueue.h>
 #endif
 
+#if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
+    #include <sched.h>
+    #define THREAD_YIELD() sched_yield() // Use POSIX sched_yield to do a direct system call
+#else
+    #define THREAD_YIELD() std::this_thread::yield() // Fallback to C++ STL thread yield
+#endif
+
+#include <time.h>
+constexpr struct timespec NANOSECOND_SLEEP{.tv_sec = 0, .tv_nsec = 1};
+#define THREAD_SLEEP() nanosleep(&NANOSECOND_SLEEP, nullptr)
+
 constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
 using q_val_t = uint64_t;
@@ -40,8 +52,10 @@ constexpr uint64_t BBQ_ENTRIES_PER_BLOCK = 10'000;
 constexpr uint64_t BENCHMARK_ITEM_COUNT = 100'000'000;
 constexpr queues::QueueMode QUEUE_MODE = queues::QueueMode::RETRY_NEW;
 
-// Enable correctness checks for complex benchmarks; Slows down the benchmark significantly
-constexpr bool CORR_CHECKS = false;
+// Do additional correctness checks in benchmarks; Slows down the benchmarks significantly
+#ifndef CORR_CHECKS
+    #define CORR_CHECKS 0
+#endif
 
 // Percentage of results to trim from both ends
 constexpr double TRIM_PERCENTAGE = 0.1;
@@ -150,7 +164,8 @@ enum class TimeUnit : uint8_t
     NANOSECONDS = 0,
     MICROSECONDS = 1,
     MILLISECONDS = 2,
-    SECONDS = 3
+    SECONDS = 3,
+    MINUTES = 4
 };
 
 std::string time_unit_to_string(TimeUnit unit)
@@ -165,6 +180,8 @@ std::string time_unit_to_string(TimeUnit unit)
             return "ms";
         case TimeUnit::SECONDS:
             return "s";
+        case TimeUnit::MINUTES:
+            return "min";
         default:
             return "unknown";
     }
@@ -174,20 +191,21 @@ template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::i
 std::string round_up_measurement(T val, TimeUnit val_unit, std::string_view suffix = "")
 {
     double calculation = val;
-    TimeUnit current_unit = val_unit;
-    while (calculation >= 1000 && current_unit != TimeUnit::SECONDS)
+
+    using underlying = std::underlying_type_t<TimeUnit>;
+    while (calculation >= 1000.0 && val_unit != TimeUnit::MINUTES)
     {
-        calculation /= 1000;
-        current_unit = static_cast<TimeUnit>(static_cast<uint8_t>(current_unit) + 1);
+        calculation /= 1000.0;
+        val_unit = static_cast<TimeUnit>(static_cast<underlying>(val_unit) + 1);
     }
 
     // If the value is an integer, format it without decimal places
     if constexpr (std::is_integral_v<T>)
-        return std::format("{} {}{}", calculation, time_unit_to_string(current_unit), suffix);
+        return std::format("{} {}{}", calculation, time_unit_to_string(val_unit), suffix);
     else if (std::abs(std::round(calculation) - calculation) < 0.0001f)
-        return std::format("{:.0f} {}{}", static_cast<double>(calculation), time_unit_to_string(current_unit), suffix);
+        return std::format("{:.0f} {}{}", calculation, time_unit_to_string(val_unit), suffix);
     else
-        return std::format("{:.4f} {}{}", static_cast<double>(calculation), time_unit_to_string(current_unit), suffix);
+        return std::format("{:.4f} {}{}", calculation, time_unit_to_string(val_unit), suffix);
 }
 
 /// @brief Pretty-prints the (aggregate) benchmark results to the console.
@@ -235,39 +253,38 @@ void print_benchmark_results(const BenchmarkResult& res)
         else
             print_err("Error: Mismatched enqueued and dequeued item counts!");
 
-        if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
+        std::unordered_set<q_val_t> seen;
+        bool duplicate_found = false;
+        bool missing_found = false;
+
+        if (res.deq_items != nullptr)
         {
-            std::unordered_set<q_val_t> seen;
-            bool duplicate_found = false;
-            bool missing_found = false;
-
-            if (res.deq_items != nullptr)
+            for (q_val_t v : *(res.deq_items))
             {
-                for (q_val_t v : *(res.deq_items))
+                auto [it, inserted] = seen.insert(v);
+                if (!inserted)
                 {
-                    auto [it, inserted] = seen.insert(v);
-                    if (!inserted)
-                    {
-                        std::cerr << "[CPLX] Error: Duplicate item detected: " << v << std::endl;
-                        duplicate_found = true;
-                    }
+                    std::cerr << "[CPLX] Error: Duplicate item detected: " << v << std::endl;
+                    duplicate_found = true;
                 }
-
-                for (q_val_t i = 0; i < total_items; ++i)
-                {
-                    if (seen.find(i) == seen.end())
-                    {
-                        std::cerr << "[CPLX] Error: Item " << i << " was not found in the dequeued items!" << std::endl;
-                        missing_found = true;
-                    }
-                }
-
-                if (!duplicate_found && !missing_found)
-                    std::cout << "[CPLX] Success: All expected items were found exactly once." << std::endl;
-                else
-                    std::cerr << "[CPLX] Error: Issues detected in dequeued items (see above)." << std::endl;
             }
+
+            for (q_val_t i = 0; i < total_items; ++i)
+            {
+                if (seen.find(i) == seen.end())
+                {
+                    std::cerr << "[CPLX] Error: Item " << i << " was not found in the dequeued items!" << std::endl;
+                    missing_found = true;
+                }
+            }
+
+            if (!duplicate_found && !missing_found)
+                std::cout << "[CPLX] Success: All expected items were found exactly once." << std::endl;
+            else
+                std::cerr << "[CPLX] Error: Issues detected in dequeued items (see above)." << std::endl;
         }
+#endif
     }
 
     std::cout << std::endl;
@@ -333,6 +350,81 @@ void print_benchmark_results(const BenchmarkResult& res)
     }
 
     std::cout << std::endl;
+}
+
+/**
+ * @brief Trims the provided vector by removing a specified percentage of elements
+ *
+ * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
+ * @param v The target vector to trim.
+ * @param trim_pct The percentage of elements to trim from both ends of the vector.
+ */
+template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
+void trim_vector(std::vector<T>& v, double trim_pct)
+{
+    if (v.empty())
+        return;
+
+    if (trim_pct <= 0.0 || trim_pct >= 0.5)
+    {
+        std::cout << "Warning: The provided trim percentage is out of bounds (0.0 <= N <= 0.5). "
+                     "Skipping trimming."
+                  << std::endl;
+    }
+
+    std::sort(v.begin(), v.end());
+    std::size_t trim_num = static_cast<std::size_t>(std::ceil(v.size() * trim_pct));
+    if (trim_num * 2 >= v.size())
+    {
+        std::cout << "Warning: The number of elements to trim is too large. "
+                     "Skipping trimming."
+                  << std::endl;
+        return;
+    }
+
+    v.erase(v.begin(), v.begin() + trim_num);
+    v.erase(v.end() - trim_num, v.end());
+}
+
+/**
+ * @brief Calculates the mean of the provided vector.
+ *
+ * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
+ * @param v The target vector to calculate the mean of.
+ * @return double The resulting mean value.
+ */
+template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
+double calculate_mean(const std::vector<T>& v)
+{
+    if (v.empty())
+        return 0.0;
+
+    T sum = std::accumulate(v.begin(), v.end(), static_cast<T>(0));
+    return static_cast<double>(sum) / v.size();
+}
+
+/**
+ * @brief Calculates the standard deviation of the provided vector.
+ *
+ * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
+ * @param v The target vector to calculate the standard deviation of.
+ * @return double The resulting standard deviation value.
+ */
+template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
+double calculate_std_dev(const std::vector<T>& v)
+{
+    if (v.empty())
+        return 0.0;
+
+    double mean = calculate_mean(v);
+    double accum = 0.0;
+    for (const auto& val : v)
+    {
+        double diff = static_cast<double>(val) - mean;
+        accum += diff * diff;
+    }
+
+    return std::sqrt(accum / v.size());
 }
 
 /**
@@ -421,16 +513,8 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
         std::cout << "[" << params.label << "] Iteration " << params.iteration + 1 << " completed." << std::endl;
 
     // Calculate mean producer and consumer times
-    uint64_t total_prod_ns = 0;
-    for (uint8_t i = 0; i < params.num_prod; i++)
-        total_prod_ns += prod_times_ns[i];
-
-    uint64_t total_cons_ns = 0;
-    for (uint8_t i = 0; i < params.num_cons; i++)
-        total_cons_ns += cons_times_ns[i];
-
-    double mean_prod_ns = static_cast<double>(total_prod_ns) / params.num_prod;
-    double mean_cons_ns = static_cast<double>(total_cons_ns) / params.num_cons;
+    double mean_prod_ns = calculate_mean(prod_times_ns);
+    double mean_cons_ns = calculate_mean(cons_times_ns);
 
     // Read final enqueue/dequeue counts (updated once per thread at the end)
     uint64_t enq_count = params.enq_counter.load(std::memory_order_relaxed);
@@ -452,81 +536,6 @@ BenchmarkResult run_benchmark(const BenchmarkParams& params, ProdFunc prod_func,
     res.queue_mode = QUEUE_MODE;
 
     return res;
-}
-
-/**
- * @brief Trims the provided vector by removing a specified percentage of elements
- *
- * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
- * @param v The target vector to trim.
- * @param trim_pct The percentage of elements to trim from both ends of the vector.
- */
-template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
-void trim_vector(std::vector<T>& v, double trim_pct)
-{
-    if (v.empty())
-        return;
-
-    if (trim_pct <= 0.0 || trim_pct >= 0.5)
-    {
-        std::cout << "Warning: The provided trim percentage is out of bounds (0.0 <= N <= 0.5). "
-                     "Skipping trimming."
-                  << std::endl;
-    }
-
-    std::sort(v.begin(), v.end());
-    std::size_t trim_num = static_cast<std::size_t>(std::ceil(v.size() * trim_pct));
-    if (trim_num * 2 >= v.size())
-    {
-        std::cout << "Warning: The number of elements to trim is too large. "
-                     "Skipping trimming."
-                  << std::endl;
-        return;
-    }
-
-    v.erase(v.begin(), v.begin() + trim_num);
-    v.erase(v.end() - trim_num, v.end());
-}
-
-/**
- * @brief Calculates the mean of the provided vector.
- *
- * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
- * @param v The target vector to calculate the mean of.
- * @return double The resulting mean value.
- */
-template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
-double calculate_mean(const std::vector<T>& v)
-{
-    if (v.empty())
-        return 0.0;
-
-    T sum = std::accumulate(v.begin(), v.end(), static_cast<T>(0));
-    return static_cast<double>(sum) / v.size();
-}
-
-/**
- * @brief Calculates the standard deviation of the provided vector.
- *
- * @tparam T The type of elements stored in the vector. Must be either integral or floating-point type.
- * @param v The target vector to calculate the standard deviation of.
- * @return double The resulting standard deviation value.
- */
-template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>>>
-double calculate_std_dev(const std::vector<T>& v)
-{
-    if (v.empty())
-        return 0.0;
-
-    double mean = calculate_mean(v);
-    double accum = 0.0;
-    for (const auto& val : v)
-    {
-        double diff = static_cast<double>(val) - mean;
-        accum += diff * diff;
-    }
-
-    return std::sqrt(accum / v.size());
 }
 
 /**
@@ -613,7 +622,8 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
 {
     std::atomic<uint64_t> enq_counter{0};
     std::atomic<uint64_t> deq_counter{0};
-    std::atomic<bool> producer_done{false};
+    alignas(CACHELINE_SIZE) std::atomic<bool> producer_done{false};
+    alignas(CACHELINE_SIZE) BenchmarkResult res;
 
     // In retry-new mode, we can calculate the throughput
     if constexpr (QUEUE_MODE == queues::QueueMode::RETRY_NEW)
@@ -637,27 +647,20 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
     std::cout << "[SMPL] == Logs ================================================" << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
         producer_done.store(false, std::memory_order_release);
         params.iteration = i;
 
-        BenchmarkResult res = run_benchmark(
+        res = run_benchmark(
             params,
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                uint64_t i = 0;
-                while (i < BENCHMARK_ITEM_COUNT)
-                {
-                    if (bbq.enqueue(i) == queues::OpStatus::OK)
-                    {
-                        ++i;
-                        continue;
-                    }
-
-                    std::this_thread::yield();
-                }
+                for (uint64_t j = 0; j < BENCHMARK_ITEM_COUNT; ++j)
+                    while (bbq.enqueue(j) != queues::OpStatus::OK)
+                        THREAD_SLEEP();
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
@@ -668,14 +671,10 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
                     {
                         buf = bbq.dequeue();
 
-                        if constexpr (CORR_CHECKS)
-                        {
-                            if (buf.second == queues::OpStatus::OK)
-                            {
-                                if (!buf.first.has_value()) [[unlikely]]
-                                    abort();
-                            }
-                        }
+#if CORR_CHECKS
+                        if (buf.second == queues::OpStatus::OK && !buf.first.has_value()) [[unlikely]]
+                            abort();
+#endif
 
                         if (buf.second == queues::OpStatus::EMPTY && producer_done.load(std::memory_order_acquire))
                             return nullptr;
@@ -687,17 +686,22 @@ BenchmarkResult run_simple_benchmark(const uint32_t iters, const uint32_t thread
                     while (i < BENCHMARK_ITEM_COUNT)
                     {
                         buf = bbq.dequeue();
+                        // clang-format off
                         if (buf.second == queues::OpStatus::OK)
                         {
-                            if constexpr (CORR_CHECKS)
-                            {
-                                // Verify that the dequeued value matches the expected value
-                                if (!buf.first.has_value() || buf.first.value() != i) [[unlikely]]
-                                    abort();
-                            }
+#if CORR_CHECKS
+                            // Verify that the dequeued value matches the expected value
+                            if (!buf.first.has_value() || buf.first.value() != i) [[unlikely]]
+                                abort();
+#endif
 
                             ++i;
                         }
+                        else
+                        {
+                            THREAD_SLEEP();
+                        }
+                        // clang-format on
                     }
                 }
             });
@@ -720,8 +724,7 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
 
     std::mutex queue_mutex;
     std::vector<q_val_t> deq_items;
-    if constexpr (CORR_CHECKS)
-        deq_items.reserve(BENCHMARK_ITEM_COUNT);
+    deq_items.reserve(BENCHMARK_ITEM_COUNT);
 
     alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
 
@@ -741,6 +744,7 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
     std::cout << "[CPLX] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
@@ -754,79 +758,51 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
             params,
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                for (uint64_t j = 0; j < items_per_prod; j++)
+                uint64_t local_counter = 0;
+                for (uint64_t j = 0; j < items_per_prod; ++j)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
                     while (bbq.enqueue(item_val) != queues::OpStatus::OK)
-                        std::this_thread::yield();
+                        THREAD_YIELD();
 
-                    enq_counter.fetch_add(1, std::memory_order_relaxed);
+                    ++local_counter;
                 }
+
+                enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
                 std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
+                uint64_t local_counter = 0;
 
-                if constexpr (QUEUE_MODE == queues::QueueMode::DROP_OLD)
+                while (true)
                 {
-                    while (true)
+                    buf = bbq.dequeue();
+                    // clang-format off
+                    if (buf.second == queues::OpStatus::OK)
                     {
-                        buf = bbq.dequeue();
-                        if (buf.second == queues::OpStatus::OK)
-                        {
-                            if constexpr (CORR_CHECKS)
-                            {
-                                if (!buf.first.has_value())
-                                    abort();
-                            }
+                        ++local_counter;
 
-                            if constexpr (CORR_CHECKS)
-                            {
-                                std::scoped_lock lock(queue_mutex);
-                                deq_items.emplace_back(buf.first.value());
-                            }
+#if CORR_CHECKS
+                        if (!buf.first.has_value())
+                            abort(); // This should never happen in a well-formed queue
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        else if (buf.second == queues::OpStatus::EMPTY)
                         {
-                            if (producers_done.load(std::memory_order_acquire))
-                                break; // Exit: producers are done and queue is empty
-                            std::this_thread::yield();
+                            std::scoped_lock lock(queue_mutex);
+                            deq_items.emplace_back(buf.first.value());
                         }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
+#endif
                     }
-                }
-                else
-                {
-                    while (deq_counter.load(std::memory_order_acquire) < BENCHMARK_ITEM_COUNT)
+                    else if (buf.second == queues::OpStatus::EMPTY && producers_done.load(std::memory_order_acquire))
+                        break; // Exit: producers are done and queue is empty
+                    else
                     {
-                        buf = bbq.dequeue();
-                        if (buf.second == queues::OpStatus::OK)
-                        {
-                            if constexpr (CORR_CHECKS)
-                            {
-                                if (!buf.first.has_value())
-                                    abort(); // This should never happen in a well-formed queue
-                            }
-
-                            if constexpr (CORR_CHECKS)
-                            {
-                                std::scoped_lock lock(queue_mutex);
-                                deq_items.emplace_back(buf.first.value());
-                            }
-
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
+                        THREAD_YIELD();
                     }
+                    // clang-format on
                 }
+
+                deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             });
 
         results.emplace_back(std::move(res));
@@ -860,18 +836,21 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
             {
                 queues::OpStatus status;
                 uint64_t j = 0;
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+
                 while (j < items_per_prod)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    auto start = std::chrono::steady_clock::now();
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    start = std::chrono::steady_clock::now();
                     status = bbq.enqueue(item_val);
-                    auto end = std::chrono::steady_clock::now();
+                    end = std::chrono::steady_clock::now();
 
                     if (status == queues::OpStatus::OK)
                     {
                         enq_latencies_ns[item_val] =
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                        j++;
+                        ++j;
                     }
                     else if (status == queues::OpStatus::FULL)
                     {
@@ -879,83 +858,55 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
                         enq_latencies_full_ns.push_back(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                     else
                     {
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                 }
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
                 std::pair<std::optional<uint64_t>, queues::OpStatus> buf;
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+                uint64_t local_counter = 0;
 
-                if constexpr (QUEUE_MODE == queues::QueueMode::DROP_OLD)
+                while (true)
                 {
-                    while (true)
+                    start = std::chrono::steady_clock::now();
+                    buf = bbq.dequeue();
+                    end = std::chrono::steady_clock::now();
+                    if (buf.second == queues::OpStatus::OK)
                     {
-                        auto start = std::chrono::steady_clock::now();
-                        buf = bbq.dequeue();
-                        auto end = std::chrono::steady_clock::now();
-                        if (buf.second == queues::OpStatus::OK)
+                        ++local_counter;
                         {
                             std::scoped_lock lock(op_lat_mutex);
                             deq_latencies_ns.push_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
-                        else if (buf.second == queues::OpStatus::EMPTY)
-                        {
-                            if (producers_done.load(std::memory_order_acquire))
-                                break; // Exit: producers are done and queue is empty
-
-                            {
-                                std::scoped_lock lock(op_lat_empty_mutex);
-                                deq_latencies_empty_ns.push_back(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                            }
-
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
                     }
-                }
-                else
-                {
-                    while (deq_counter.load(std::memory_order_acquire) < BENCHMARK_ITEM_COUNT)
+                    else if (buf.second == queues::OpStatus::EMPTY)
                     {
-                        auto start = std::chrono::steady_clock::now();
-                        buf = bbq.dequeue();
-                        auto end = std::chrono::steady_clock::now();
-                        if (buf.second == queues::OpStatus::OK)
                         {
-                            {
-                                std::scoped_lock lock(op_lat_mutex);
-                                deq_latencies_ns.push_back(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                            }
+                            std::scoped_lock lock(op_lat_empty_mutex);
+                            deq_latencies_empty_ns.push_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        }
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        else if (buf.second == queues::OpStatus::EMPTY)
-                        {
-                            {
-                                std::scoped_lock lock(op_lat_empty_mutex);
-                                deq_latencies_empty_ns.push_back(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                            }
+                        if (producers_done.load(std::memory_order_acquire))
+                            break; // Exit: producers are done and queue is empty
 
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
+                        THREAD_YIELD();
+                    }
+                    else
+                    {
+                        THREAD_YIELD();
                     }
                 }
+
+                deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             });
 
         if (i < results.size())
@@ -1002,6 +953,7 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
     std::cout << "[STL] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         std::queue<q_val_t> stl_queue;
@@ -1014,16 +966,20 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
             params,
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                for (uint32_t j = 0; j < items_per_prod; j++)
+                uint64_t local_counter = 0;
+                for (uint32_t j = 0; j < items_per_prod; ++j)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
                     {
                         std::unique_lock<std::mutex> lock(stl_mtx);
                         stl_queue.push(item_val);
                     }
-                    enq_counter.fetch_add(1, std::memory_order_relaxed);
+
+                    ++local_counter;
                     stl_cv.notify_one();
                 }
+
+                enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
@@ -1070,15 +1026,18 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
             params,
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
-                for (uint32_t j = 0; j < items_per_prod; j++)
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+
+                for (uint32_t j = 0; j < items_per_prod; ++j)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    auto start = std::chrono::steady_clock::now();
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    start = std::chrono::steady_clock::now();
                     {
                         std::unique_lock<std::mutex> lock(stl_mtx);
                         stl_queue.push(item_val);
                     }
-                    auto end = std::chrono::steady_clock::now();
+                    end = std::chrono::steady_clock::now();
                     enq_latencies_ns[item_val] =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
@@ -1087,6 +1046,9 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+
                 while (deq_counter.load(std::memory_order_relaxed) < BENCHMARK_ITEM_COUNT)
                 {
                     std::unique_lock<std::mutex> lock(stl_mtx);
@@ -1097,18 +1059,18 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
                                            deq_counter.load(std::memory_order_relaxed) >= BENCHMARK_ITEM_COUNT;
                                 });
 
-                    auto start = std::chrono::steady_clock::now();
+                    start = std::chrono::steady_clock::now();
                     if (!stl_queue.empty())
                     {
                         stl_queue.pop();
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         deq_latencies_ns.push_back(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         deq_counter.fetch_add(1, std::memory_order_relaxed);
                     }
                     else
                     {
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         deq_latencies_empty_ns.push_back(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                     }
@@ -1143,10 +1105,11 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
     alignas(CACHELINE_SIZE) std::atomic<bool> producers_done{false};
     alignas(CACHELINE_SIZE) BenchmarkResult res;
 
+#if CORR_CHECKS
     std::mutex queue_mutex;
     std::vector<q_val_t> deq_items;
-    if constexpr (CORR_CHECKS)
-        deq_items.reserve(BENCHMARK_ITEM_COUNT);
+    deq_items.reserve(BENCHMARK_ITEM_COUNT);
+#endif
 
     alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
 
@@ -1157,7 +1120,11 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                            .num_cons = num_cons,
                            .enq_counter = enq_counter,
                            .deq_counter = deq_counter,
+#if CORR_CHECKS
                            .deq_items = &deq_items,
+#else
+                           .deq_items = nullptr,
+#endif
                            .producers_done = &producers_done,
                            .iteration = -1};
 
@@ -1179,6 +1146,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
     std::cout << "[BST-LFQ] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         producers_done.store(false, std::memory_order_release);
@@ -1196,36 +1164,46 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 params,
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
-                    for (uint64_t j = 0; j < items_per_prod; j++)
+                    uint64_t local_counter = 0;
+                    for (uint64_t j = 0; j < items_per_prod; ++j)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
                         while (!boost_spsc_q->push(item_val))
-                            std::this_thread::yield();
+                            THREAD_YIELD();
 
-                        enq_counter.fetch_add(1, std::memory_order_relaxed);
+                        ++local_counter;
                     }
+
+                    enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 },
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
                     q_val_t item_val;
+                    uint64_t local_counter = 0;
+
                     while (true)
                     {
+                        // clang-format off
                         while (boost_spsc_q->pop(item_val))
                         {
-                            if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
                             {
                                 std::scoped_lock lock(queue_mutex);
                                 deq_items.emplace_back(item_val);
                             }
+#endif
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                            ++local_counter;
                         }
+                        // clang-format on
 
                         if (boost_spsc_q->empty() && producers_done.load(std::memory_order_acquire))
                             break;
 
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
+
+                    deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 });
         }
         else
@@ -1236,36 +1214,46 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 params,
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
-                    for (uint64_t j = 0; j < items_per_prod; j++)
+                    uint64_t local_counter = 0;
+                    for (uint64_t j = 0; j < items_per_prod; ++j)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
                         while (!boost_q->push(item_val))
-                            std::this_thread::yield();
+                            THREAD_YIELD();
 
-                        enq_counter.fetch_add(1, std::memory_order_relaxed);
+                        ++local_counter;
                     }
+
+                    enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 },
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
                     q_val_t item_val;
+                    uint64_t local_counter = 0;
+
                     while (true)
                     {
+                        // clang-format off
                         while (boost_q->pop(item_val))
                         {
-                            if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
                             {
                                 std::scoped_lock lock(queue_mutex);
                                 deq_items.emplace_back(item_val);
                             }
+#endif
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                            ++local_counter;
                         }
+                        // clang-format on
 
                         if (boost_q->empty() && producers_done.load(std::memory_order_acquire))
                             break;
 
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
+
+                    deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 });
         }
 
@@ -1303,18 +1291,21 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 {
                     bool success = false;
                     uint64_t j = 0;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        auto start = std::chrono::steady_clock::now();
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        start = std::chrono::steady_clock::now();
                         success = boost_spsc_q->push(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
 
                         if (success)
                         {
                             enq_latencies_ns[item_val] =
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            j++;
+                            ++j;
                         }
                         else
                         {
@@ -1324,7 +1315,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 },
@@ -1332,11 +1323,15 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 {
                     q_val_t item_val;
                     bool success = false;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (true)
                     {
-                        auto start = std::chrono::steady_clock::now();
+                        start = std::chrono::steady_clock::now();
                         success = boost_spsc_q->pop(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
+
                         if (success)
                         {
                             std::scoped_lock lock(op_lat_mutex);
@@ -1357,7 +1352,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                                     break;
                             }
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 });
@@ -1372,18 +1367,21 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 {
                     bool success = false;
                     uint64_t j = 0;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        auto start = std::chrono::steady_clock::now();
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        start = std::chrono::steady_clock::now();
                         success = boost_q->push(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
 
                         if (success)
                         {
                             enq_latencies_ns[item_val] =
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            j++;
+                            ++j;
                         }
                         else
                         {
@@ -1393,7 +1391,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 },
@@ -1401,11 +1399,14 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                 {
                     q_val_t item_val;
                     bool success = false;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (true)
                     {
-                        auto start = std::chrono::steady_clock::now();
+                        start = std::chrono::steady_clock::now();
                         success = boost_q->pop(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         if (success)
                         {
                             std::scoped_lock lock(op_lat_mutex);
@@ -1426,7 +1427,7 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                                     break;
                             }
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 });
@@ -1460,10 +1461,11 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
     alignas(CACHELINE_SIZE) std::atomic<bool> producers_done{false};
     alignas(CACHELINE_SIZE) BenchmarkResult res;
 
+#if CORR_CHECKS
     std::mutex queue_mutex;
     std::vector<q_val_t> deq_items;
-    if constexpr (CORR_CHECKS)
-        deq_items.reserve(BENCHMARK_ITEM_COUNT);
+    deq_items.reserve(BENCHMARK_ITEM_COUNT);
+#endif
 
     alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
 
@@ -1474,7 +1476,11 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                            .num_cons = num_cons,
                            .enq_counter = enq_counter,
                            .deq_counter = deq_counter,
+#if CORR_CHECKS
                            .deq_items = &deq_items,
+#else
+                           .deq_items = nullptr,
+#endif
                            .producers_done = &producers_done,
                            .iteration = -1};
 
@@ -1482,6 +1488,7 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
     std::cout << "[BST-BSYNCQ] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         producers_done.store(false, std::memory_order_release);
@@ -1498,50 +1505,59 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
             {
                 boost::concurrent::queue_op_status status;
                 uint64_t j = 0;
+                uint64_t local_counter = 0;
+
                 while (j < items_per_prod)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
                     status = boost_q.try_push_back(item_val);
                     if (status == boost::concurrent::queue_op_status::success)
                     {
-                        enq_counter.fetch_add(1, std::memory_order_relaxed);
-                        j++;
+                        ++local_counter;
+                        ++j;
                     }
                     else
                     {
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                 }
+
+                enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             },
             [&]([[maybe_unused]] uint8_t thread_idx)
             {
                 q_val_t item_val;
                 boost::concurrent::queue_op_status status;
+                uint64_t local_counter = 0;
+
                 while (true)
                 {
                     status = boost_q.try_pull_front(item_val);
+                    // clang-format off
                     if (status == boost::concurrent::queue_op_status::success)
                     {
-                        if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
                         {
                             std::scoped_lock lock(queue_mutex);
                             deq_items.emplace_back(item_val);
                         }
+#endif
 
-                        deq_counter.fetch_add(1, std::memory_order_relaxed);
+                        ++local_counter;
                     }
-                    else if (status == boost::concurrent::queue_op_status::empty)
+                    else if (status == boost::concurrent::queue_op_status::empty &&
+                             producers_done.load(std::memory_order_acquire))
                     {
-                        if (producers_done.load(std::memory_order_acquire))
-                            break; // Exit: producers are done and queue is empty
-
-                        std::this_thread::yield();
+                        break; // Exit: producers are done and queue is empty
                     }
                     else
                     {
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
+                    // clang-format on
                 }
+
+                deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
             });
 
         results.emplace_back(std::move(res));
@@ -1575,17 +1591,20 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
             {
                 boost::concurrent::queue_op_status status;
                 uint64_t j = 0;
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+
                 while (j < items_per_prod)
                 {
-                    q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    auto start = std::chrono::steady_clock::now();
+                    const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                    start = std::chrono::steady_clock::now();
                     status = boost_q.try_push_back(item_val);
-                    auto end = std::chrono::steady_clock::now();
+                    end = std::chrono::steady_clock::now();
                     if (status == boost::concurrent::queue_op_status::success)
                     {
                         enq_latencies_ns[item_val] =
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                        j++;
+                        ++j;
                     }
                     else if (status == boost::concurrent::queue_op_status::full)
                     {
@@ -1595,11 +1614,11 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
 
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                     else
                     {
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                 }
             },
@@ -1607,11 +1626,14 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
             {
                 q_val_t item_val;
                 boost::concurrent::queue_op_status status;
+                auto start = std::chrono::steady_clock::time_point{};
+                auto end = std::chrono::steady_clock::time_point{};
+
                 while (true)
                 {
-                    auto start = std::chrono::steady_clock::now();
+                    start = std::chrono::steady_clock::now();
                     status = boost_q.try_pull_front(item_val);
-                    auto end = std::chrono::steady_clock::now();
+                    end = std::chrono::steady_clock::now();
                     if (status == boost::concurrent::queue_op_status::success)
                     {
                         std::scoped_lock lock(op_lat_mutex);
@@ -1629,11 +1651,11 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                         if (producers_done.load(std::memory_order_acquire))
                             break; // Exit: producers are done and queue is empty
 
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                     else
                     {
-                        std::this_thread::yield();
+                        THREAD_YIELD();
                     }
                 }
             });
@@ -1666,10 +1688,11 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
     alignas(CACHELINE_SIZE) std::atomic<bool> producers_done{false};
     alignas(CACHELINE_SIZE) BenchmarkResult res;
 
+    #if CORR_CHECKS
     std::mutex queue_mutex;
     std::vector<q_val_t> deq_items;
-    if constexpr (CORR_CHECKS)
-        deq_items.reserve(BENCHMARK_ITEM_COUNT);
+    deq_items.reserve(BENCHMARK_ITEM_COUNT);
+    #endif
 
     alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
 
@@ -1680,7 +1703,11 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                            .num_cons = num_cons,
                            .enq_counter = enq_counter,
                            .deq_counter = deq_counter,
+    #if CORR_CHECKS
                            .deq_items = &deq_items,
+    #else
+                           .deq_items = nullptr,
+    #endif
                            .producers_done = &producers_done,
                            .iteration = -1};
 
@@ -1694,6 +1721,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
     std::cout << "[FOLLYQ] Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
+    results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
         producers_done.store(false, std::memory_order_release);
@@ -1712,50 +1740,57 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     bool success;
                     uint64_t j = 0;
+                    uint64_t local_counter = 0;
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
                         success = folly_q.write(std::move(item_val));
                         if (success)
                         {
-                            enq_counter.fetch_add(1, std::memory_order_relaxed);
-                            j++;
+                            ++local_counter;
+                            ++j;
                         }
                         else
                         {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
+
+                    enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 },
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
                     q_val_t item_val;
                     bool success;
+                    uint64_t local_counter = 0;
+
                     while (true)
                     {
                         success = folly_q.read(item_val);
+                        // clang-format off
                         if (success)
                         {
-                            if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
                             {
                                 std::scoped_lock lock(queue_mutex);
                                 deq_items.emplace_back(item_val);
                             }
+#endif
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                            ++local_counter;
                         }
-                        else if (folly_q.isEmpty())
+                        else
                         {
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
+                        // clang-format on
                     }
+
+                    deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 });
         }
         else
@@ -1768,50 +1803,57 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     bool success;
                     uint64_t j = 0;
+                    uint64_t local_counter = 0;
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
                         success = folly_q.write(std::move(item_val));
                         if (success)
                         {
-                            enq_counter.fetch_add(1, std::memory_order_relaxed);
-                            j++;
+                            ++local_counter;
+                            ++j;
                         }
                         else
                         {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
+
+                    enq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 },
                 [&]([[maybe_unused]] uint8_t thread_idx)
                 {
                     q_val_t item_val;
                     bool success;
+                    uint64_t local_counter = 0;
+
                     while (true)
                     {
                         success = folly_q.read(item_val);
+                        // clang-format off
                         if (success)
                         {
-                            if constexpr (CORR_CHECKS)
+#if CORR_CHECKS
                             {
                                 std::scoped_lock lock(queue_mutex);
                                 deq_items.emplace_back(item_val);
                             }
+#endif
 
-                            deq_counter.fetch_add(1, std::memory_order_relaxed);
+                            ++local_counter;
                         }
-                        else if (folly_q.isEmpty())
+                        else
                         {
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
-                        else
-                        {
-                            std::this_thread::yield();
-                        }
+                        // clang-format on
                     }
+
+                    deq_counter.fetch_add(local_counter, std::memory_order_relaxed);
                 });
         }
 
@@ -1848,19 +1890,22 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     bool success;
                     uint64_t j = 0;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        auto start = std::chrono::steady_clock::now();
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        start = std::chrono::steady_clock::now();
                         success = folly_q.write(std::move(item_val));
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         if (success)
                         {
                             enq_latencies_ns[item_val] =
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            j++;
+                            ++j;
                         }
-                        else if (folly_q.isFull())
+                        else
                         {
                             {
                                 std::scoped_lock lock(op_lat_full_mutex);
@@ -1868,11 +1913,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
 
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 },
@@ -1880,18 +1921,21 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     q_val_t item_val;
                     bool success;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (true)
                     {
-                        auto start = std::chrono::steady_clock::now();
+                        start = std::chrono::steady_clock::now();
                         success = folly_q.read(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         if (success)
                         {
                             std::scoped_lock lock(op_lat_mutex);
                             deq_latencies_ns.push_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
-                        else if (folly_q.isEmpty())
+                        else
                         {
                             {
                                 std::scoped_lock lock(op_lat_empty_mutex);
@@ -1902,11 +1946,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 });
@@ -1921,19 +1961,22 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     bool success;
                     uint64_t j = 0;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (j < items_per_prod)
                     {
-                        q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        auto start = std::chrono::steady_clock::now();
+                        const q_val_t item_val = (thread_idx * items_per_prod) + j;
+                        start = std::chrono::steady_clock::now();
                         success = folly_q.write(std::move(item_val));
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         if (success)
                         {
                             enq_latencies_ns[item_val] =
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            j++;
+                            ++j;
                         }
-                        else if (folly_q.isFull())
+                        else
                         {
                             {
                                 std::scoped_lock lock(op_lat_full_mutex);
@@ -1941,11 +1984,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
 
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 },
@@ -1953,18 +1992,21 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                 {
                     q_val_t item_val;
                     bool success;
+                    auto start = std::chrono::steady_clock::time_point{};
+                    auto end = std::chrono::steady_clock::time_point{};
+
                     while (true)
                     {
-                        auto start = std::chrono::steady_clock::now();
+                        start = std::chrono::steady_clock::now();
                         success = folly_q.read(item_val);
-                        auto end = std::chrono::steady_clock::now();
+                        end = std::chrono::steady_clock::now();
                         if (success)
                         {
                             std::scoped_lock lock(op_lat_mutex);
                             deq_latencies_ns.push_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
-                        else if (folly_q.isEmpty())
+                        else
                         {
                             {
                                 std::scoped_lock lock(op_lat_empty_mutex);
@@ -1975,11 +2017,7 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
-                            std::this_thread::yield();
-                        }
-                        else
-                        {
-                            std::this_thread::yield();
+                            THREAD_YIELD();
                         }
                     }
                 });
@@ -2206,6 +2244,8 @@ void print_help(const std::string& program_name)
 }
 // clang-format on
 
+// TODO: Add local counters where possible to reduce the use of atomic operations
+
 int main(int argc, char** argv)
 {
     std::string benchmark_mode;
@@ -2292,7 +2332,7 @@ int main(int argc, char** argv)
                           << "Limiting to " << std::thread::hardware_concurrency() << "." << std::endl;
             }
 
-            bool explicit_thread_count = true; // User explicitly set the thread count
+            explicit_thread_count = true; // User explicitly set the thread count
         }
         else if (arg == "--disable-optimized-spsc")
         {
