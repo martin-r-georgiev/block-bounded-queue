@@ -33,25 +33,9 @@ FetchContent_Declare(
 
 if(NOT EXISTS "${FETCHCONTENT_BASE_DIR}/boost-src")
     message(STATUS "Boost library not found. Fetching boost...")
-    FetchContent_Populate(boost)
 endif()
 
 FetchContent_MakeAvailable(boost)
-
-# glog (Google Logging)
-# set(GLOG_VER v0.7.1)
-# FetchContent_Declare(
-#   glog
-#   GIT_REPOSITORY https://github.com/google/glog.git
-#   GIT_TAG        ${GLOG_VER}
-# )
-
-# if(NOT EXISTS "${FETCHCONTENT_BASE_DIR}/glog-src")
-#     message(STATUS "Google Logging library not found. Fetching glog...")
-#     FetchContent_Populate(glog)
-# endif()
-
-# FetchContent_MakeAvailable(glog)
 
 # Folly
 find_package(glog QUIET)
