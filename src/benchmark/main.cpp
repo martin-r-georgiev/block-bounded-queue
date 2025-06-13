@@ -67,6 +67,8 @@ constexpr queues::QueueMode QUEUE_MODE = queues::QueueMode::RETRY_NEW;
 
 // Percentage of results to trim from both ends
 constexpr double TRIM_PERCENTAGE = 0.1;
+constexpr uint64_t SAMPLE_RATE = 1000; // Record a sample very SAMPLE_RATE operations
+constexpr uint64_t SAMPLE_COUNT = (BENCHMARK_ITEM_COUNT / SAMPLE_RATE);
 
 constexpr double NS_PER_SEC = 1'000'000'000.0;
 
@@ -756,9 +758,11 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
     alignas(CACHELINE_SIZE) std::atomic<bool> producers_done{false};
     alignas(CACHELINE_SIZE) BenchmarkResult res;
 
+#if CORR_CHECKS
     std::mutex queue_mutex;
     std::vector<q_val_t> deq_items;
     deq_items.reserve(BENCHMARK_ITEM_COUNT);
+#endif
 
     alignas(CACHELINE_SIZE) const uint64_t items_per_prod = BENCHMARK_ITEM_COUNT / num_prod;
 
@@ -769,7 +773,11 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
                            .num_cons = num_cons,
                            .enq_counter = enq_counter,
                            .deq_counter = deq_counter,
+#if CORR_CHECKS
                            .deq_items = &deq_items,
+#else
+                           .deq_items = nullptr,
+#endif
                            .producers_done = &producers_done,
                            .is_bbq = true,
                            .total_iters = iters};
@@ -843,25 +851,20 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "Running latency benchmarks..." << std::endl;
-
-    std::mutex op_lat_mutex;
-    std::mutex op_lat_full_mutex;
-    std::mutex op_lat_empty_mutex;
+    std::cout << "Running enqueue(OK) and dequeue(OK) latency benchmarks..." << std::endl;
 
     for (uint32_t i = 0; i < iters; ++i)
     {
         queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
-        deq_counter.store(0, std::memory_order_release);
         producers_done.store(false, std::memory_order_release);
 
-        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> enq_latencies_ns;
+        enq_latencies_ns.reserve(SAMPLE_COUNT);
         std::vector<uint64_t> deq_latencies_ns;
-        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> enq_latencies_full_ns;
-        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> deq_latencies_empty_ns;
-        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+        deq_latencies_ns.reserve(SAMPLE_COUNT);
+
+        std::mutex op_enq_lat_mutex;
+        std::mutex op_deq_lat_mutex;
 
         params.curr_iter = i;
 
@@ -877,23 +880,29 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
                 while (j < items_per_prod)
                 {
                     const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    start = std::chrono::steady_clock::now();
-                    status = bbq.enqueue(item_val);
-                    end = std::chrono::steady_clock::now();
+                    const bool do_sample = (j % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        start = std::chrono::steady_clock::now();
+                        status = bbq.enqueue(item_val);
+                        end = std::chrono::steady_clock::now();
+                    }
+                    else
+                    {
+                        status = bbq.enqueue(item_val);
+                    }
 
                     if (status == queues::OpStatus::OK)
                     {
-                        enq_latencies_ns[item_val] =
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
                         ++j;
-                    }
-                    else if (status == queues::OpStatus::FULL)
-                    {
-                        std::scoped_lock lock(op_lat_full_mutex);
-                        enq_latencies_full_ns.push_back(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 
-                        THREAD_YIELD();
+                        if (do_sample)
+                        {
+                            std::scoped_lock lock(op_enq_lat_mutex);
+                            enq_latencies_ns.emplace_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        }
                     }
                     else
                     {
@@ -910,30 +919,33 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
 
                 while (true)
                 {
-                    start = std::chrono::steady_clock::now();
-                    buf = bbq.dequeue();
-                    end = std::chrono::steady_clock::now();
+                    const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        start = std::chrono::steady_clock::now();
+                        buf = bbq.dequeue();
+                        end = std::chrono::steady_clock::now();
+                    }
+                    else
+                    {
+                        buf = bbq.dequeue();
+                    }
+
                     if (buf.second == queues::OpStatus::OK)
                     {
                         ++local_counter;
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_mutex);
-                            deq_latencies_ns.push_back(
+                            std::scoped_lock lock(op_deq_lat_mutex);
+                            deq_latencies_ns.emplace_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
                     }
-                    else if (buf.second == queues::OpStatus::EMPTY)
+                    else if (buf.second == queues::OpStatus::EMPTY && producers_done.load(std::memory_order_acquire))
                     {
-                        {
-                            std::scoped_lock lock(op_lat_empty_mutex);
-                            deq_latencies_empty_ns.push_back(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                        }
-
-                        if (producers_done.load(std::memory_order_acquire))
-                            break; // Exit: producers are done and queue is empty
-
-                        THREAD_YIELD();
+                        break; // Exit: producers are done and queue is empty
                     }
                     else
                     {
@@ -947,8 +959,79 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
         if (i < results.size())
         {
             results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
-            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    std::cout << "Running enqueue(FULL) and dequeue(EMPTY) latency benchmarks..." << std::endl;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        display_progress_bar(i, iters, "Progress", PROG_BAR_WIDTH);
+
+        queues::BlockBoundedQueue<q_val_t, QUEUE_MODE> bbq(BBQ_NUM_BLOCKS, BBQ_ENTRIES_PER_BLOCK);
+        producers_done.store(false, std::memory_order_release);
+
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(SAMPLE_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(SAMPLE_COUNT);
+
+        auto start = std::chrono::steady_clock::time_point{};
+        auto end = std::chrono::steady_clock::time_point{};
+
+        for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+            bbq.enqueue(j); // Fill the queue to ensure it is full
+
+        for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+        {
+            start = std::chrono::steady_clock::now();
+            auto status = bbq.enqueue(j);
+            end = std::chrono::steady_clock::now();
+
+            if (status == queues::OpStatus::FULL)
+            {
+                enq_latencies_full_ns.emplace_back(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            }
+            else if (status != queues::OpStatus::OK)
+            {
+                std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(status)
+                          << std::endl;
+                abort();
+            }
+        }
+
+        for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+            bbq.dequeue(); // Empty the queue to ensure it is empty
+
+        for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+        {
+            start = std::chrono::steady_clock::now();
+            auto buf = bbq.dequeue();
+            end = std::chrono::steady_clock::now();
+
+            if (buf.second == queues::OpStatus::EMPTY)
+            {
+                deq_latencies_empty_ns.emplace_back(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            }
+            else if (buf.second != queues::OpStatus::OK)
+            {
+                std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(buf.second)
+                          << std::endl;
+                abort();
+            }
+        }
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
         }
         else
@@ -956,6 +1039,8 @@ BenchmarkResult run_complex_benchmark(const uint8_t num_prod, const uint8_t num_
             std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
                       << std::endl;
         }
+
+        display_progress_bar(i + 1, iters, "Progress", PROG_BAR_WIDTH);
     }
 
     auto aggr = aggregate_results(results);
@@ -1039,22 +1124,17 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "Running latency benchmarks..." << std::endl;
-
-    std::mutex op_lat_mutex;
-    std::mutex op_lat_full_mutex;
-    std::mutex op_lat_empty_mutex;
+    std::cout << "Running enqueue(OK) and dequeue(OK) latency benchmarks..." << std::endl;
 
     for (uint32_t i = 0; i < iters; ++i)
     {
         std::queue<q_val_t> stl_queue;
         deq_counter.store(0, std::memory_order_release);
 
-        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> enq_latencies_ns;
+        enq_latencies_ns.reserve(SAMPLE_COUNT);
         std::vector<uint64_t> deq_latencies_ns;
-        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> deq_latencies_empty_ns;
-        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+        deq_latencies_ns.reserve(SAMPLE_COUNT);
 
         params.curr_iter = i;
 
@@ -1068,14 +1148,22 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
                 for (uint32_t j = 0; j < items_per_prod; ++j)
                 {
                     const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    start = std::chrono::steady_clock::now();
+                    const bool do_sample = (j % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        std::unique_lock<std::mutex> lock(stl_mtx);
+                        start = std::chrono::steady_clock::now();
+                        stl_queue.push(item_val);
+                        end = std::chrono::steady_clock::now();
+                        enq_latencies_ns.emplace_back(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                    }
+                    else
                     {
                         std::unique_lock<std::mutex> lock(stl_mtx);
                         stl_queue.push(item_val);
                     }
-                    end = std::chrono::steady_clock::now();
-                    enq_latencies_ns[item_val] =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
                     stl_cv.notify_one();
                 }
@@ -1085,30 +1173,34 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
                 auto start = std::chrono::steady_clock::time_point{};
                 auto end = std::chrono::steady_clock::time_point{};
 
-                while (deq_counter.load(std::memory_order_relaxed) < BENCHMARK_ITEM_COUNT)
+                while (deq_counter.load(std::memory_order_acquire) < BENCHMARK_ITEM_COUNT)
                 {
                     std::unique_lock<std::mutex> lock(stl_mtx);
                     stl_cv.wait(lock,
                                 [&]
                                 {
                                     return !stl_queue.empty() ||
-                                           deq_counter.load(std::memory_order_relaxed) >= BENCHMARK_ITEM_COUNT;
+                                           deq_counter.load(std::memory_order_acquire) >= BENCHMARK_ITEM_COUNT;
                                 });
 
-                    start = std::chrono::steady_clock::now();
-                    if (!stl_queue.empty())
+                    const bool do_sample = (deq_counter.load(std::memory_order_acquire) % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        start = std::chrono::steady_clock::now();
+                        if (!stl_queue.empty())
+                        {
+                            stl_queue.pop();
+                            end = std::chrono::steady_clock::now();
+                            deq_latencies_ns.emplace_back(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            deq_counter.fetch_add(1, std::memory_order_acq_rel);
+                        }
+                    }
+                    else if (!stl_queue.empty())
                     {
                         stl_queue.pop();
-                        end = std::chrono::steady_clock::now();
-                        deq_latencies_ns.push_back(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                        deq_counter.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    else
-                    {
-                        end = std::chrono::steady_clock::now();
-                        deq_latencies_empty_ns.push_back(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                        deq_counter.fetch_add(1, std::memory_order_acq_rel);
                     }
                 }
             });
@@ -1117,6 +1209,39 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
         {
             results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
             results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    std::cout << "Running dequeue(EMPTY) latency benchmarks..." << std::endl;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        display_progress_bar(i, iters, "Progress", PROG_BAR_WIDTH);
+
+        std::queue<q_val_t> stl_queue;
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(SAMPLE_COUNT);
+
+        auto start = std::chrono::steady_clock::time_point{};
+        auto end = std::chrono::steady_clock::time_point{};
+
+        for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+        {
+            start = std::chrono::steady_clock::now();
+            if (stl_queue.empty())
+                ; // std::queue's pop() has undefined behavior so the only check we can do is on empty()
+            end = std::chrono::steady_clock::now();
+            deq_latencies_empty_ns.emplace_back(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+        }
+
+        if (i < results.size())
+        {
             results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
         }
         else
@@ -1124,6 +1249,8 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
             std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
                       << std::endl;
         }
+
+        display_progress_bar(i + 1, iters, "Progress", PROG_BAR_WIDTH);
     }
 
     auto aggr = aggregate_results(results);
@@ -1133,6 +1260,7 @@ BenchmarkResult run_stl_queue_benchmark(const uint8_t num_prod, const uint8_t nu
 
 // Based on example from Boost documentation:
 // https://www.boost.org/doc/libs/master/doc/html/lockfree/examples.html
+// Note: Boost's queue seems to work the same as the "RETRY_NEW" mode of BlockBoundedQueue
 BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
                                                    const uint32_t thread_count, bool disable_optimized_spsc = false)
 {
@@ -1176,11 +1304,11 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
               << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
 
     if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
-        std::cout << "[BST-LFQ] Using wait-free single-producer/single-consumer (SPSC) queue." << std::endl;
+        std::cout << "Using wait-free single-producer/single-consumer (SPSC) queue." << std::endl;
     else
-        std::cout << "[BST-LFQ] Using lock-free multi-producer/multi-consumer (MPMC) queue." << std::endl;
+        std::cout << "Using lock-free multi-producer/multi-consumer (MPMC) queue." << std::endl;
 
-    std::cout << "[BST-LFQ] Running throughput benchmarks..." << std::endl;
+    std::cout << "Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
@@ -1297,23 +1425,19 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "[BST-LFQ] Running latency benchmarks..." << std::endl;
-
-    std::mutex op_lat_mutex;
-    std::mutex op_lat_full_mutex;
-    std::mutex op_lat_empty_mutex;
+    std::cout << "Running enqueue(OK) and dequeue(OK) latency benchmarks..." << std::endl;
 
     for (uint32_t i = 0; i < iters; ++i)
     {
         producers_done.store(false, std::memory_order_release);
 
-        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> enq_latencies_ns;
+        enq_latencies_ns.reserve(SAMPLE_COUNT);
         std::vector<uint64_t> deq_latencies_ns;
-        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> enq_latencies_full_ns;
-        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> deq_latencies_empty_ns;
-        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+        deq_latencies_ns.reserve(SAMPLE_COUNT);
+
+        std::mutex op_enq_lat_mutex;
+        std::mutex op_deq_lat_mutex;
 
         params.curr_iter = i;
 
@@ -1334,24 +1458,32 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                     while (j < items_per_prod)
                     {
                         const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        start = std::chrono::steady_clock::now();
-                        success = boost_spsc_q->push(item_val);
-                        end = std::chrono::steady_clock::now();
+                        const bool do_sample = (j % SAMPLE_RATE == 0);
 
-                        if (success)
+                        if (do_sample)
                         {
-                            enq_latencies_ns[item_val] =
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            ++j;
+                            start = std::chrono::steady_clock::now();
+                            success = boost_spsc_q->push(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = boost_spsc_q->push(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++j;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_full_mutex);
-                                enq_latencies_full_ns.push_back(
+                                std::scoped_lock lock(op_enq_lat_mutex);
+                                enq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -1362,33 +1494,39 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                     bool success = false;
                     auto start = std::chrono::steady_clock::time_point{};
                     auto end = std::chrono::steady_clock::time_point{};
+                    uint64_t local_counter = 0;
 
                     while (true)
                     {
-                        start = std::chrono::steady_clock::now();
-                        success = boost_spsc_q->pop(item_val);
-                        end = std::chrono::steady_clock::now();
-
-                        if (success)
+                        const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_mutex);
-                            deq_latencies_ns.push_back(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            start = std::chrono::steady_clock::now();
+                            success = boost_spsc_q->pop(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
-                            if (boost_spsc_q->empty())
+                            success = boost_spsc_q->pop(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++local_counter;
+
+                            if (do_sample)
                             {
-                                {
-                                    std::scoped_lock lock(op_lat_empty_mutex);
-                                    deq_latencies_empty_ns.push_back(
-                                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                                }
-
-                                if (producers_done.load(std::memory_order_acquire))
-                                    break;
+                                std::scoped_lock lock(op_deq_lat_mutex);
+                                deq_latencies_ns.emplace_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else if (boost_spsc_q->empty() && producers_done.load(std::memory_order_acquire))
+                        {
+                            break;
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -1410,24 +1548,32 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                     while (j < items_per_prod)
                     {
                         const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        start = std::chrono::steady_clock::now();
-                        success = boost_q->push(item_val);
-                        end = std::chrono::steady_clock::now();
+                        const bool do_sample = (j % SAMPLE_RATE == 0);
 
-                        if (success)
+                        if (do_sample)
                         {
-                            enq_latencies_ns[item_val] =
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            ++j;
+                            start = std::chrono::steady_clock::now();
+                            success = boost_q->push(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = boost_q->push(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++j;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_full_mutex);
-                                enq_latencies_full_ns.push_back(
+                                std::scoped_lock lock(op_enq_lat_mutex);
+                                enq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -1438,32 +1584,40 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
                     bool success = false;
                     auto start = std::chrono::steady_clock::time_point{};
                     auto end = std::chrono::steady_clock::time_point{};
+                    uint64_t local_counter = 0;
 
                     while (true)
                     {
-                        start = std::chrono::steady_clock::now();
-                        success = boost_q->pop(item_val);
-                        end = std::chrono::steady_clock::now();
-                        if (success)
+                        const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_mutex);
-                            deq_latencies_ns.push_back(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            start = std::chrono::steady_clock::now();
+                            success = boost_q->pop(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
-                            if (boost_q->empty())
+                            success = boost_q->pop(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++local_counter;
+
+                            if (do_sample)
                             {
-                                {
-                                    std::scoped_lock lock(op_lat_empty_mutex);
-                                    deq_latencies_empty_ns.push_back(
-                                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                                }
-
-                                if (producers_done.load(std::memory_order_acquire))
-                                    break;
+                                std::scoped_lock lock(op_deq_lat_mutex);
+                                deq_latencies_ns.emplace_back(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else if (boost_q->empty() && producers_done.load(std::memory_order_acquire))
+                        {
+                            break; // Exit: producers are done and queue is empty
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -1473,8 +1627,134 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
         if (i < results.size())
         {
             results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
-            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    std::cout << "Running enqueue(FULL) and dequeue(EMPTY) latency benchmarks..." << std::endl;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        display_progress_bar(i, iters, "Progress", PROG_BAR_WIDTH);
+
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(SAMPLE_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(SAMPLE_COUNT);
+
+        auto start = std::chrono::steady_clock::time_point{};
+        auto end = std::chrono::steady_clock::time_point{};
+
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
+        {
+            auto boost_q =
+                std::make_unique<boost::lockfree::spsc_queue<q_val_t, boost::lockfree::capacity<Q_CAPACITY>>>();
+
+            for (uint64_t j = 0; j < Q_CAPACITY; ++j)
+                boost_q->push(j); // Fill the queue to ensure it is full
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = boost_q->push(j);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    enq_latencies_full_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+
+            q_val_t item_val;
+
+            for (uint64_t j = 0; j < Q_CAPACITY; ++j)
+                boost_q->pop(item_val); // Empty the queue to ensure it is empty
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = boost_q->pop(item_val);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    deq_latencies_empty_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+        }
+        else
+        {
+            auto boost_q = std::make_unique<boost::lockfree::queue<q_val_t, boost::lockfree::capacity<Q_CAPACITY>>>();
+
+            for (uint64_t j = 0; j < Q_CAPACITY; ++j)
+                boost_q->push(j); // Fill the queue to ensure it is full
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = boost_q->push(j);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    enq_latencies_full_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+
+            q_val_t item_val;
+
+            for (uint64_t j = 0; j < Q_CAPACITY; ++j)
+                boost_q->pop(item_val); // Empty the queue to ensure it is empty
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = boost_q->pop(item_val);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    deq_latencies_empty_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+        }
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
         }
         else
@@ -1482,6 +1762,8 @@ BenchmarkResult run_boost_lockfree_queue_benchmark(const uint8_t num_prod, const
             std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
                       << std::endl;
         }
+
+        display_progress_bar(i + 1, iters, "Progress", PROG_BAR_WIDTH);
     }
 
     auto aggr = aggregate_results(results);
@@ -1523,19 +1805,18 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
 
     std::cout << "[BST-BSYNCQ] " << ANSI_CLR_BOLD_WHITE
               << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
-    std::cout << "[BST-BSYNCQ] Running throughput benchmarks..." << std::endl;
+    std::cout << "Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i)
     {
+        boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
         producers_done.store(false, std::memory_order_release);
         enq_counter.store(0, std::memory_order_release);
         deq_counter.store(0, std::memory_order_release);
 
         params.curr_iter = i;
-
-        boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
 
         res = run_benchmark(
             params,
@@ -1601,27 +1882,22 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "[BST-BSYNCQ] Running latency benchmarks..." << std::endl;
-
-    std::mutex op_lat_mutex;
-    std::mutex op_lat_full_mutex;
-    std::mutex op_lat_empty_mutex;
+    std::cout << "Running enqueue(OK) and dequeue(OK) latency benchmarks..." << std::endl;
 
     for (uint32_t i = 0; i < iters; ++i)
     {
+        boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
         producers_done.store(false, std::memory_order_release);
 
-        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> enq_latencies_ns;
+        enq_latencies_ns.reserve(SAMPLE_COUNT);
         std::vector<uint64_t> deq_latencies_ns;
-        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> enq_latencies_full_ns;
-        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> deq_latencies_empty_ns;
-        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+        deq_latencies_ns.reserve(SAMPLE_COUNT);
+
+        std::mutex op_enq_lat_mutex;
+        std::mutex op_deq_lat_mutex;
 
         params.curr_iter = i;
-
-        boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
 
         run_benchmark(
             params,
@@ -1635,24 +1911,29 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                 while (j < items_per_prod)
                 {
                     const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                    start = std::chrono::steady_clock::now();
-                    status = boost_q.try_push_back(item_val);
-                    end = std::chrono::steady_clock::now();
+                    const bool do_sample = (j % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        start = std::chrono::steady_clock::now();
+                        status = boost_q.try_push_back(item_val);
+                        end = std::chrono::steady_clock::now();
+                    }
+                    else
+                    {
+                        status = boost_q.try_push_back(item_val);
+                    }
+
                     if (status == boost::concurrent::queue_op_status::success)
                     {
-                        enq_latencies_ns[item_val] =
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
                         ++j;
-                    }
-                    else if (status == boost::concurrent::queue_op_status::full)
-                    {
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_full_mutex);
-                            enq_latencies_full_ns.push_back(
+                            std::scoped_lock lock(op_enq_lat_mutex);
+                            enq_latencies_ns.emplace_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
-
-                        THREAD_YIELD();
                     }
                     else
                     {
@@ -1666,30 +1947,38 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
                 boost::concurrent::queue_op_status status;
                 auto start = std::chrono::steady_clock::time_point{};
                 auto end = std::chrono::steady_clock::time_point{};
+                uint64_t local_counter = 0;
 
                 while (true)
                 {
-                    start = std::chrono::steady_clock::now();
-                    status = boost_q.try_pull_front(item_val);
-                    end = std::chrono::steady_clock::now();
+                    const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+
+                    if (do_sample)
+                    {
+                        start = std::chrono::steady_clock::now();
+                        status = boost_q.try_pull_front(item_val);
+                        end = std::chrono::steady_clock::now();
+                    }
+                    else
+                    {
+                        status = boost_q.try_pull_front(item_val);
+                    }
+
                     if (status == boost::concurrent::queue_op_status::success)
                     {
-                        std::scoped_lock lock(op_lat_mutex);
-                        deq_latencies_ns.push_back(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                    }
-                    else if (status == boost::concurrent::queue_op_status::empty)
-                    {
+                        ++local_counter;
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_empty_mutex);
-                            deq_latencies_empty_ns.push_back(
+                            std::scoped_lock lock(op_deq_lat_mutex);
+                            deq_latencies_ns.emplace_back(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                         }
-
-                        if (producers_done.load(std::memory_order_acquire))
-                            break; // Exit: producers are done and queue is empty
-
-                        THREAD_YIELD();
+                    }
+                    else if (status == boost::concurrent::queue_op_status::empty &&
+                             producers_done.load(std::memory_order_acquire))
+                    {
+                        break; // Exit: producers are done and queue is empty
                     }
                     else
                     {
@@ -1701,8 +1990,79 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
         if (i < results.size())
         {
             results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
-            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    std::cout << "Running enqueue(FULL) and dequeue(EMPTY) latency benchmarks..." << std::endl;
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        display_progress_bar(i, iters, "Progress", PROG_BAR_WIDTH);
+
+        boost::concurrent::sync_bounded_queue<q_val_t> boost_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(SAMPLE_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(SAMPLE_COUNT);
+
+        auto start = std::chrono::steady_clock::time_point{};
+        auto end = std::chrono::steady_clock::time_point{};
+
+        for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+            boost_q.push(j); // Fill the queue to ensure it is full
+
+        for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+        {
+            start = std::chrono::steady_clock::now();
+            auto status = boost_q.try_push_back(j);
+            end = std::chrono::steady_clock::now();
+
+            if (status == boost::concurrent::queue_op_status::full)
+            {
+                enq_latencies_full_ns.emplace_back(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            }
+            else
+            {
+                std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(status)
+                          << std::endl;
+                abort();
+            }
+        }
+
+        q_val_t item_val;
+
+        for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+            boost_q.pull(item_val); // Empty the queue to ensure it is empty
+
+        for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+        {
+            start = std::chrono::steady_clock::now();
+            auto status = boost_q.try_pull_front(item_val);
+            end = std::chrono::steady_clock::now();
+
+            if (status == boost::concurrent::queue_op_status::empty)
+            {
+                deq_latencies_empty_ns.emplace_back(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            }
+            else
+            {
+                std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(status)
+                          << std::endl;
+                abort();
+            }
+        }
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
         }
         else
@@ -1710,6 +2070,8 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
             std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
                       << std::endl;
         }
+
+        display_progress_bar(i + 1, iters, "Progress", PROG_BAR_WIDTH);
     }
 
     auto aggr = aggregate_results(results);
@@ -1753,11 +2115,11 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
               << "== Logs ================================================" << ANSI_CLR_RESET << std::endl;
 
     if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
-        std::cout << "[FOLLYQ] Using single-producer/single-consumer ProducerConsumerQueue." << std::endl;
+        std::cout << "Using single-producer/single-consumer ProducerConsumerQueue." << std::endl;
     else
-        std::cout << "[FOLLYQ] Using multi-producer/multi-consumer MPMCQueue." << std::endl;
+        std::cout << "Using multi-producer/multi-consumer MPMCQueue." << std::endl;
 
-    std::cout << "[FOLLYQ] Running throughput benchmarks..." << std::endl;
+    std::cout << "Running throughput benchmarks..." << std::endl;
 
     std::vector<BenchmarkResult> results;
     results.reserve(iters);
@@ -1899,23 +2261,19 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
         results.emplace_back(std::move(res));
     }
 
-    std::cout << "[FOLLYQ] Running latency benchmarks..." << std::endl;
-
-    std::mutex op_lat_mutex;
-    std::mutex op_lat_full_mutex;
-    std::mutex op_lat_empty_mutex;
+    std::cout << "Running enqueue(OK) and dequeue(OK) latency benchmarks..." << std::endl;
 
     for (uint32_t i = 0; i < iters; ++i)
     {
         producers_done.store(false, std::memory_order_release);
 
-        std::vector<uint64_t> enq_latencies_ns(BENCHMARK_ITEM_COUNT, 0);
+        std::vector<uint64_t> enq_latencies_ns;
+        enq_latencies_ns.reserve(SAMPLE_COUNT);
         std::vector<uint64_t> deq_latencies_ns;
-        deq_latencies_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> enq_latencies_full_ns;
-        enq_latencies_full_ns.reserve(BENCHMARK_ITEM_COUNT);
-        std::vector<uint64_t> deq_latencies_empty_ns;
-        deq_latencies_empty_ns.reserve(BENCHMARK_ITEM_COUNT);
+        deq_latencies_ns.reserve(SAMPLE_COUNT);
+
+        std::mutex op_enq_lat_mutex;
+        std::mutex op_deq_lat_mutex;
 
         params.curr_iter = i;
 
@@ -1935,23 +2293,32 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                     while (j < items_per_prod)
                     {
                         const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        start = std::chrono::steady_clock::now();
-                        success = folly_q.write(std::move(item_val));
-                        end = std::chrono::steady_clock::now();
-                        if (success)
+                        const bool do_sample = (j % SAMPLE_RATE == 0);
+
+                        if (do_sample)
                         {
-                            enq_latencies_ns[item_val] =
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            ++j;
+                            start = std::chrono::steady_clock::now();
+                            success = folly_q.write(std::move(item_val));
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = folly_q.write(std::move(item_val));
+                        }
+
+                        if (success)
+                        {
+                            ++j;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_full_mutex);
-                                enq_latencies_full_ns.push_back(
+                                std::scoped_lock lock(op_enq_lat_mutex);
+                                enq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -1962,26 +2329,36 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                     bool success;
                     auto start = std::chrono::steady_clock::time_point{};
                     auto end = std::chrono::steady_clock::time_point{};
+                    uint64_t local_counter = 0;
 
                     while (true)
                     {
-                        start = std::chrono::steady_clock::now();
-                        success = folly_q.read(item_val);
-                        end = std::chrono::steady_clock::now();
-                        if (success)
+                        const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_mutex);
-                            deq_latencies_ns.push_back(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            start = std::chrono::steady_clock::now();
+                            success = folly_q.read(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = folly_q.read(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++local_counter;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_empty_mutex);
-                                deq_latencies_empty_ns.push_back(
+                                std::scoped_lock lock(op_deq_lat_mutex);
+                                deq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
@@ -2006,23 +2383,32 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                     while (j < items_per_prod)
                     {
                         const q_val_t item_val = (thread_idx * items_per_prod) + j;
-                        start = std::chrono::steady_clock::now();
-                        success = folly_q.write(std::move(item_val));
-                        end = std::chrono::steady_clock::now();
-                        if (success)
+                        const bool do_sample = (j % SAMPLE_RATE == 0);
+
+                        if (do_sample)
                         {
-                            enq_latencies_ns[item_val] =
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                            ++j;
+                            start = std::chrono::steady_clock::now();
+                            success = folly_q.write(std::move(item_val));
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = folly_q.write(std::move(item_val));
+                        }
+
+                        if (success)
+                        {
+                            ++j;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_full_mutex);
-                                enq_latencies_full_ns.push_back(
+                                std::scoped_lock lock(op_enq_lat_mutex);
+                                enq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             THREAD_YIELD();
                         }
                     }
@@ -2033,26 +2419,36 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
                     bool success;
                     auto start = std::chrono::steady_clock::time_point{};
                     auto end = std::chrono::steady_clock::time_point{};
+                    uint64_t local_counter = 0;
 
                     while (true)
                     {
-                        start = std::chrono::steady_clock::now();
-                        success = folly_q.read(item_val);
-                        end = std::chrono::steady_clock::now();
-                        if (success)
+                        const bool do_sample = (local_counter % SAMPLE_RATE == 0);
+
+                        if (do_sample)
                         {
-                            std::scoped_lock lock(op_lat_mutex);
-                            deq_latencies_ns.push_back(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                            start = std::chrono::steady_clock::now();
+                            success = folly_q.read(item_val);
+                            end = std::chrono::steady_clock::now();
                         }
                         else
                         {
+                            success = folly_q.read(item_val);
+                        }
+
+                        if (success)
+                        {
+                            ++local_counter;
+
+                            if (do_sample)
                             {
-                                std::scoped_lock lock(op_lat_empty_mutex);
-                                deq_latencies_empty_ns.push_back(
+                                std::scoped_lock lock(op_deq_lat_mutex);
+                                deq_latencies_ns.emplace_back(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                             }
-
+                        }
+                        else
+                        {
                             if (producers_done.load(std::memory_order_acquire))
                                 break; // Exit: producers are done and queue is empty
 
@@ -2065,8 +2461,131 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
         if (i < results.size())
         {
             results[i].mean_enq_latency_ns = calculate_mean(enq_latencies_ns);
-            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_latency_ns = calculate_mean(deq_latencies_ns);
+        }
+        else
+        {
+            std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
+                      << std::endl;
+        }
+    }
+
+    for (uint32_t i = 0; i < iters; ++i)
+    {
+        display_progress_bar(i, iters, "Progress", PROG_BAR_WIDTH);
+
+        std::vector<uint64_t> enq_latencies_full_ns;
+        enq_latencies_full_ns.reserve(SAMPLE_COUNT);
+        std::vector<uint64_t> deq_latencies_empty_ns;
+        deq_latencies_empty_ns.reserve(SAMPLE_COUNT);
+
+        auto start = std::chrono::steady_clock::time_point{};
+        auto end = std::chrono::steady_clock::time_point{};
+
+        if (num_prod == 1 && num_cons == 1 && !disable_optimized_spsc)
+        {
+            folly::ProducerConsumerQueue<q_val_t> folly_q{BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK};
+
+            for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+                folly_q.write(j); // Fill the queue to ensure it is full
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = folly_q.write(j);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    enq_latencies_full_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+
+            q_val_t item_val;
+
+            for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+                folly_q.read(item_val); // Empty the queue to ensure it is empty
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = folly_q.read(item_val);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    deq_latencies_empty_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+        }
+        else
+        {
+            folly::MPMCQueue<q_val_t, std::atomic, false> folly_q(BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK);
+
+            for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+                folly_q.write(j); // Fill the queue to ensure it is full
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = folly_q.write(j);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    enq_latencies_full_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during enqueue in full queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+
+            q_val_t item_val;
+
+            for (uint64_t j = 0; j < BBQ_NUM_BLOCKS * BBQ_ENTRIES_PER_BLOCK; ++j)
+                folly_q.read(item_val); // Empty the queue to ensure it is empty
+
+            for (uint64_t j = 0; j < SAMPLE_COUNT; ++j)
+            {
+                start = std::chrono::steady_clock::now();
+                auto success = folly_q.read(item_val);
+                end = std::chrono::steady_clock::now();
+
+                if (!success)
+                {
+                    deq_latencies_empty_ns.emplace_back(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                }
+                else
+                {
+                    std::cerr << "Error: Unexpected status during dequeue in empty queue: " << static_cast<int>(success)
+                              << std::endl;
+                    abort();
+                }
+            }
+        }
+
+        if (i < results.size())
+        {
+            results[i].mean_enq_full_latency_ns = calculate_mean(enq_latencies_full_ns);
             results[i].mean_deq_empty_latency_ns = calculate_mean(deq_latencies_empty_ns);
         }
         else
@@ -2074,6 +2593,8 @@ BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_c
             std::cout << "Warning: Misalignment in benchmark results. Reported data may be inaccurate or incomplete."
                       << std::endl;
         }
+
+        display_progress_bar(i + 1, iters, "Progress", PROG_BAR_WIDTH);
     }
 
     auto aggr = aggregate_results(results);
@@ -2194,12 +2715,12 @@ void export_to_csv(const std::string& filename, const std::vector<BenchmarkResul
         return;
     }
 
-    file << "Label,Producers,Consumers,Threads,Total Elapsed Time (ns),Total Elapsed Time [SD],"
-         << "Mean Producer Elapsed Time (ns),Producer Elapsed Time [SD],Mean Consumer Elapsed Time (ns),"
-         << "Consumer Elapsed Time [SD],Total Throughput (op/s),Mean Producer Throughput (op/s),"
-         << "Mean Consumer Throughput (op/s),Mean Enqueue Latency (ns/op),Mean Enqueue Latency [SD],"
-         << "Mean Enqueue Full Latency (ns/op),Mean Enqueue Full Latency [SD],Mean Dequeue Latency (ns/op),"
-         << "Mean Dequeue Latency [SD],Mean Dequeue Empty Latency (ns),Mean Dequeue Empty Latency [SD]\n";
+    file << "label,producers,consumers,threads,total_elapsed_time_ns,total_elapsed_time_sd,"
+         << "mean_producer_elapsed_time_ns,producer_elapsed_time_sd,mean_consumer_elapsed_time_ns,"
+         << "consumer_elapsed_time_sd,total_throughput_op_s,mean_producer_throughput_op_s,"
+         << "mean_consumer_throughput_op_s,mean_enqueue_latency_ns_op,mean_enqueue_latency_sd,"
+         << "mean_enqueue_full_latency_ns_op,mean_enqueue_full_latency_sd,mean_dequeue_latency_ns_op,"
+         << "mean_dequeue_latency_sd,mean_dequeue_empty_latency_ns,mean_dequeue_empty_latency_sd\n";
 
     for (const auto& result : results)
     {
@@ -2282,8 +2803,6 @@ void print_help(const std::string& program_name)
     std::cout << "                               If not specified, results are only printed to stdout." << std::endl;
 }
 // clang-format on
-
-// TODO: Add local counters where possible to reduce the use of atomic operations
 
 int main(int argc, char** argv)
 {
