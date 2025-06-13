@@ -75,7 +75,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <memory>
 #include <optional>
 #include <type_traits>
 
@@ -158,25 +157,27 @@ public:
         : block_num_(block_num)
         , block_size_(block_size)
         , queue_capacity_(block_num * block_size)
-        , idx_bits_((block_num > 1) ? static_cast<uint8_t>(std::ceil(std::log2(block_num))) : 1)
-        , off_bits_((block_size > 1) ? static_cast<uint8_t>(std::ceil(std::log2(block_size))) + 1 : 1)
+        , idx_bits_((block_num > 1) ? static_cast<uint32_t>(std::ceil(std::log2(block_num))) : 1)
+        , off_bits_((block_size > 1) ? static_cast<uint32_t>(std::ceil(std::log2(block_size))) + 1 : 1)
         , vsn_bits_(64 - std::max(idx_bits_, off_bits_))
         , idx_mask_((idx_bits_ < 64) ? ((1ULL << idx_bits_) - 1) : ~0ULL)
         , off_mask_((off_bits_ < 64) ? ((1ULL << off_bits_) - 1) : ~0ULL)
         , vsn_mask_((vsn_bits_ < 64) ? ((1ULL << vsn_bits_) - 1) : ~0ULL)
-        , blocks_(std::make_unique<Block[]>(block_num))
         , ph_(0)
         , ch_(0)
     {
         assert(block_num > 0 && block_size > 0 && "Block number and size must be greater than 0.");
 
         // Allocate and initialize blocks.
+        blocks_ = new Block[block_num];
+        assert(blocks_ != nullptr && "Failed to allocate memory for blocks.");
+
         for (size_t i = 0; i < block_num; ++i)
             blocks_[i].init(this, block_size, i == 0);
     }
 
     /// @brief Destroys the Block Bounded Queue object, releasing all allocated resources.
-    ~BlockBoundedQueue() = default;
+    ~BlockBoundedQueue() { delete[] blocks_; }
 
     /**
      * @brief Enqueues an element into the queue.
@@ -184,17 +185,17 @@ public:
      * @param data The data to be enqueued.
      * @return OpStatus The result of the enqueue operation.
      */
-    OpStatus enqueue(const T& data)
+    OpStatus enqueue(T data) noexcept
     {
     loop:
         auto [ph, blk] = get_phead_and_block();
         EntryDesc entry(blk);
-        State state = allocate_entry(blk, entry);
+        const State state = allocate_entry(blk, entry);
         switch (state)
         {
             case State::ALLOCATED:
                 // Successfully allocated an entry.
-                commit_entry(entry, data);
+                commit_entry(entry, std::move(data));
                 return OpStatus::OK;
             case State::BLOCK_DONE:
                 switch (advance_phead(ph))
@@ -221,21 +222,22 @@ public:
      * @return A pair containing an optional T (the dequeued value if successful, otherwise std::nullopt)
      * and the dequeue OpStatus.
      */
-    const std::pair<std::optional<T>, OpStatus> dequeue()
+    const std::pair<std::optional<T>, OpStatus> dequeue() noexcept
     {
     loop:
         auto [ch, blk] = get_chead_and_block();
         EntryDesc entry(blk);
-        State state = reserve_entry(blk, entry);
-        std::optional<T> opt_data;
+        const State state = reserve_entry(blk, entry);
         switch (state)
         {
             case State::RESERVED:
-                opt_data = consume_entry(entry);
+            {
+                const auto opt_data = consume_entry(entry);
                 if (opt_data.has_value())
-                    return {opt_data.value(), OpStatus::OK};
+                    return {std::move(opt_data), OpStatus::OK};
                 else
                     goto loop;
+            }
             case State::NO_ENTRY:
                 return {std::nullopt, OpStatus::EMPTY};
             case State::NOT_AVAILABLE:
@@ -261,8 +263,8 @@ public:
         Block* blk = get_phead_and_block().second;
 
         // Load consumed first to prevent it from advancing past committed
-        std::size_t consumed = blk->consumed.load(std::memory_order_acquire);
-        std::size_t committed = blk->committed.load(std::memory_order_acquire);
+        const std::size_t consumed = blk->consumed.load(std::memory_order_acquire);
+        const std::size_t committed = blk->committed.load(std::memory_order_acquire);
         return (cursor_off(consumed) == cursor_off(committed)) && (cursor_vsn(consumed) == cursor_vsn(committed));
     }
 
@@ -276,9 +278,19 @@ private:
     {
         Block() : entries(nullptr), allocated(0), committed(0), reserved(0), consumed(0) {}
 
+        ~Block()
+        {
+            if (!entries)
+                return;
+
+            delete[] entries;
+            entries = nullptr;
+        }
+
         void init(const BlockBoundedQueue* parent, const std::size_t num_entries, const bool is_first)
         {
-            entries = std::make_unique<T[]>(num_entries);
+            entries = new T[num_entries];
+            assert(entries != nullptr && "Failed to allocate memory for block entries.");
 
             // If not the first block, set the cursors' offset to the block size.
             if (!is_first)
@@ -306,7 +318,7 @@ private:
         /// @brief A consumer cursor pointing to the last entry in the block that has been consumed.
         alignas(CACHELINE_SIZE) std::atomic<std::size_t> consumed;
 
-        std::unique_ptr<T[]> entries;
+        alignas(CACHELINE_SIZE) T* entries;
     };
 
     /// @brief A metadata structure that describes an entry in the queue.
@@ -379,7 +391,7 @@ private:
     const std::size_t vsn_mask_;
 
     /// @brief The internal queue block array.
-    std::unique_ptr<Block[]> blocks_;
+    alignas(CACHELINE_SIZE) Block* blocks_;
 
     /// @brief The queue-level producer head (P.Head).
     alignas(CACHELINE_SIZE) std::atomic<std::size_t> ph_;
@@ -460,7 +472,7 @@ private:
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_phead_and_block() const noexcept
     {
         const std::size_t ph_val = ph_.load(std::memory_order_acquire);
-        Block* blk = blocks_.get() + block_idx(ph_val);
+        Block* blk = blocks_ + block_idx(ph_val);
         BUILTIN_PREFETCH(blk, 0, 2);
 
         return {ph_val, blk};
@@ -469,7 +481,7 @@ private:
     ATTR_ALWAYS_INLINE const std::pair<std::size_t, Block*> get_chead_and_block() const noexcept
     {
         const std::size_t ch_val = ch_.load(std::memory_order_acquire);
-        Block* blk = blocks_.get() + block_idx(ch_val);
+        Block* blk = blocks_ + block_idx(ch_val);
         BUILTIN_PREFETCH(blk, 0, 2);
 
         return {ch_val, blk};
@@ -489,7 +501,7 @@ private:
         return State::ALLOCATED;
     }
 
-    ATTR_ALWAYS_INLINE void commit_entry(EntryDesc& entry, T data) noexcept
+    ATTR_ALWAYS_INLINE void commit_entry(EntryDesc& entry, T&& data) noexcept
     {
         entry.block->entries[entry.offset] = std::move(data);
         entry.block->committed.fetch_add(1, std::memory_order_release);
@@ -499,7 +511,7 @@ private:
     {
         const std::size_t nblk_idx = (block_idx(ph) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ph) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = blocks_.get() + nblk_idx;
+        Block* nblk = blocks_ + nblk_idx;
         BUILTIN_PREFETCH(nblk, 0, 2);
 
         if constexpr (mode == QueueMode::RETRY_NEW)
@@ -592,7 +604,7 @@ private:
     {
         const std::size_t nblk_idx = (block_idx(ch) + 1) % block_num_;
         const std::size_t nblk_vsn = block_vsn(ch) + (nblk_idx == 0 ? 1 : 0);
-        Block* nblk = blocks_.get() + nblk_idx;
+        Block* nblk = blocks_ + nblk_idx;
         BUILTIN_PREFETCH(nblk, 0, 2);
 
         const std::size_t committed = nblk->committed.load(std::memory_order_acquire);
