@@ -36,9 +36,13 @@
     #define THREAD_YIELD() std::this_thread::yield() // Fallback to C++ STL thread yield
 #endif
 
-#include <time.h>
+#if defined(__linux__) || defined(__unix__)
+    #include <time.h>
 constexpr struct timespec NANOSECOND_SLEEP{.tv_sec = 0, .tv_nsec = 1};
-#define THREAD_SLEEP() nanosleep(&NANOSECOND_SLEEP, nullptr)
+    #define THREAD_SLEEP() nanosleep(&NANOSECOND_SLEEP, nullptr)
+#else
+    #define THREAD_SLEEP() std::this_thread::sleep_for(std::chrono::nanoseconds(1))
+#endif
 
 constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
@@ -293,7 +297,7 @@ void print_benchmark_results(const BenchmarkResult& res)
                 auto [it, inserted] = seen.insert(v);
                 if (!inserted)
                 {
-                    std::cerr << "[CPLX] Error: Duplicate item detected: " << v << std::endl;
+                    print_err(std::format("Error: Duplicate item detected: {}", v));
                     duplicate_found = true;
                 }
             }
@@ -302,15 +306,15 @@ void print_benchmark_results(const BenchmarkResult& res)
             {
                 if (seen.find(i) == seen.end())
                 {
-                    std::cerr << "[CPLX] Error: Item " << i << " was not found in the dequeued items!" << std::endl;
+                    print_err(std::format("Error: Item \"{}\" was not found in the dequeued items!", i));
                     missing_found = true;
                 }
             }
 
             if (!duplicate_found && !missing_found)
-                std::cout << "[CPLX] Success: All expected items were found exactly once." << std::endl;
+                print_msg("Success: All expected items were found exactly once.");
             else
-                std::cerr << "[CPLX] Error: Issues detected in dequeued items (see above)." << std::endl;
+                print_err("Error: Issues detected in dequeued items (see above).");
         }
 #endif
     }
