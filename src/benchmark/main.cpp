@@ -2720,7 +2720,7 @@ void export_to_csv(const std::string& filename, const std::vector<BenchmarkResul
          << "consumer_elapsed_time_sd,total_throughput_op_s,mean_producer_throughput_op_s,"
          << "mean_consumer_throughput_op_s,mean_enqueue_latency_ns_op,mean_enqueue_latency_sd,"
          << "mean_enqueue_full_latency_ns_op,mean_enqueue_full_latency_sd,mean_dequeue_latency_ns_op,"
-         << "mean_dequeue_latency_sd,mean_dequeue_empty_latency_ns,mean_dequeue_empty_latency_sd\n";
+         << "mean_dequeue_latency_sd,mean_dequeue_empty_latency_ns_op,mean_dequeue_empty_latency_sd\n";
 
     for (const auto& result : results)
     {
