@@ -6,7 +6,12 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_compile_options(-fdiagnostics-all-candidates)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-fdiagnostics-all-candidates" HAS_DIAG_ALL_CANDIDATES)
+if(HAS_DIAG_ALL_CANDIDATES)
+    add_compile_options(-fdiagnostics-all-candidates)
+endif()
+
 add_compile_options(-Wno-interference-size)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

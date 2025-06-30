@@ -24,7 +24,7 @@
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/thread/sync_bounded_queue.hpp>
 
-#ifdef ENABLE_FOLLY_BENCHMARKS
+#if ENABLE_FOLLY_BENCHMARKS
     #include <folly/MPMCQueue.h>
     #include <folly/ProducerConsumerQueue.h>
 #endif
@@ -2146,7 +2146,7 @@ BenchmarkResult run_boost_sync_bounded_queue_benchmark(const uint8_t num_prod, c
     return aggr;
 }
 
-#ifdef ENABLE_FOLLY_BENCHMARKS
+#if ENABLE_FOLLY_BENCHMARKS
 BenchmarkResult run_follyq_benchmark(const uint8_t num_prod, const uint8_t num_cons, const uint32_t iters,
                                      const uint32_t thread_count, const bool run_tp, const bool run_lat,
                                      bool disable_optimized_spsc = false)
@@ -2691,7 +2691,7 @@ enum class TestMode
     STL,
     BOOST_LFQ,
     BOOST_SYNC_BOUNDED,
-#ifdef ENABLE_FOLLY_BENCHMARKS
+#if ENABLE_FOLLY_BENCHMARKS
     FOLLYQ,
 #endif
     UNKNOWN
@@ -2779,7 +2779,7 @@ TestMode parse_mode(const std::string& mode)
         return TestMode::BOOST_LFQ;
     if (lower_mode == "boost-bsyncq")
         return TestMode::BOOST_SYNC_BOUNDED;
-#ifdef ENABLE_FOLLY_BENCHMARKS
+#if ENABLE_FOLLY_BENCHMARKS
     if (lower_mode == "follyq")
         return TestMode::FOLLYQ;
 #endif
@@ -2862,7 +2862,7 @@ void print_help(const std::string& program_name)
     std::cout << "                    on the Boost lockfree queue. All options are supported." << std::endl;
     std::cout << "    boost-bsyncq    Run a configurable multi-producer/multi-consumer benchmark" << std::endl;
     std::cout << "                    on the Boost sync_bounded_queue. All options are supported." << std::endl;
-    #ifdef ENABLE_FOLLY_BENCHMARKS
+    #if ENABLE_FOLLY_BENCHMARKS
     std::cout << "    follyq          Run a configurable multi-producer/multi-consumer benchmark" << std::endl;
     std::cout << "                    on the Folly MPMC queue. All options are supported." << std::endl;
     #endif
@@ -3082,7 +3082,7 @@ int main(int argc, char** argv)
                     results.emplace_back(run_boost_sync_bounded_queue_benchmark(p, c, num_iter, num_threads,
                                                                                 run_throughput, run_latency));
                     break;
-#ifdef ENABLE_FOLLY_BENCHMARKS
+#if ENABLE_FOLLY_BENCHMARKS
                 case TestMode::FOLLYQ:
                     results.emplace_back(run_follyq_benchmark(p, c, num_iter, num_threads, run_throughput, run_latency,
                                                               disable_optimized_spsc));
