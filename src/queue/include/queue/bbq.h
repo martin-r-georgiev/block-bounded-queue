@@ -579,13 +579,14 @@ private:
 
     [[nodiscard]] std::optional<T> consume_entry(EntryDesc& entry) noexcept
     {
-        T data = std::move(entry.block->entries[entry.offset]);
-
         if constexpr (mode == QueueMode::RETRY_NEW)
         {
             // In retry-new mode, we can safely consume the entry as long as
             // the reserve operation was successful.
             entry.block->consumed.fetch_add(1, std::memory_order_release);
+
+            T data = std::move(entry.block->entries[entry.offset]);
+            return data;
         }
         else
         {
@@ -595,9 +596,10 @@ private:
             const std::size_t allocated = entry.block->allocated.load(std::memory_order_acquire);
             if (cursor_vsn(allocated) != entry.version) [[unlikely]]
                 return std::nullopt;
-        }
 
-        return data;
+            T data = std::move(entry.block->entries[entry.offset]);
+            return data;
+        }
     }
 
     bool advance_chead(std::size_t ch, std::size_t version) noexcept
