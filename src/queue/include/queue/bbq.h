@@ -493,7 +493,7 @@ private:
         if (cursor_off(allocated) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
-        const std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_acq_rel);
+        const std::size_t old_cursor = blk->allocated.fetch_add(1, std::memory_order_relaxed);
         if (cursor_off(old_cursor) >= block_size_) [[unlikely]]
             return State::BLOCK_DONE;
 
