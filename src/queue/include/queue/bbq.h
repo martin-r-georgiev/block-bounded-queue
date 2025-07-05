@@ -276,7 +276,7 @@ private:
     /// @brief The block abstraction used in the queue to split the queue's entries.
     struct Block
     {
-        Block() : entries(nullptr), allocated(0), committed(0), reserved(0), consumed(0) {}
+        Block() : allocated(0), committed(0), reserved(0), consumed(0), entries(nullptr) {}
 
         ~Block()
         {
@@ -487,7 +487,7 @@ private:
         return {ch_val, blk};
     }
 
-    const State allocate_entry(Block* blk, EntryDesc& entry) noexcept
+    State allocate_entry(Block* blk, EntryDesc& entry) noexcept
     {
         const std::size_t allocated = blk->allocated.load(std::memory_order_acquire);
         if (cursor_off(allocated) >= block_size_) [[unlikely]]
