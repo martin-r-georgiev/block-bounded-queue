@@ -270,6 +270,27 @@ public:
 
     ATTR_ALWAYS_INLINE std::size_t capacity() const noexcept { return queue_capacity_; }
 
+    /// @brief Returns the number of elements currently in the queue.
+    /// @note Pending operations are ignored in this count.
+    /// Entries allocated but not yet committed are not considered part of the queue.
+    /// Reserved entries awaiting consumption still count as present in the queue.
+    /// @return The number of elements in the queue.
+    std::size_t size() const noexcept
+    {
+        // Get the consumer first to avoid cases where the consumer pointer gets in front of the producer
+        auto [ch, blk] = get_chead_and_block();
+        const std::size_t consumed = blk->consumed.load(std::memory_order_acquire);
+
+        // Next get the producer
+        auto [ph, pblk] = get_phead_and_block();
+        const std::size_t committed = pblk->committed.load(std::memory_order_acquire);
+
+        // Calculate the size based on the cursors
+        std::size_t c_pos = (block_vsn(ch) * block_num_ + block_idx(ch)) * block_size_ + cursor_off(consumed);
+        std::size_t p_pos = (block_vsn(ph) * block_num_ + block_idx(ph)) * block_size_ + cursor_off(committed);
+        return p_pos - c_pos;
+    }
+
     /// @brief Clears the queue, resetting its state
     /// @remark This method should only be used in a single-threaded context while the queue is not in active use.
     /// In any other case, behavior is undefined and is likely to cause memory-related errors.
