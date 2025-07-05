@@ -270,6 +270,23 @@ public:
 
     ATTR_ALWAYS_INLINE std::size_t capacity() const noexcept { return queue_capacity_; }
 
+    /// @brief Clears the queue, resetting its state
+    /// @remark This method should only be used in a single-threaded context while the queue is not in active use.
+    /// In any other case, behavior is undefined and is likely to cause memory-related errors.
+    void clear() noexcept
+    {
+        delete[] blocks_;
+        blocks_ = new Block[block_num_];
+        assert(blocks_ != nullptr && "Failed to allocate memory for blocks.");
+
+        for (size_t i = 0; i < block_num_; ++i)
+            blocks_[i].init(this, block_size_, i == 0);
+
+        // Reset the producer and consumer heads.
+        ph_.store(0, std::memory_order_relaxed);
+        ch_.store(0, std::memory_order_relaxed);
+    }
+
 private:
     static constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
