@@ -1,19 +1,14 @@
 # BBQ.h
----
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/martin-r-georgiev/block-bounded-queue/master/LICENSE)
 
 A state-of-the-art bounded multi-producer multi-consumer concurrent queue written in C++23. The experimental lock-free algorithm is based on the publication ["BBQ: A Block-based Bounded Queue for Exchanging Data and Profiling" by Wang et al. (2022)](https://www.usenix.org/conference/atc22/presentation/wang-jiawei).
-
----
 
 ## Features
 - Fixed-size queue with a capacity that can be declared at runtime.
 - The queue can operate in two modes: `RETRY_NEW` and `DROP_OLD`.
   - **RETRY_NEW**: In retry-new mode, producers cannot insert data when the queue is full. Depending on the queue’s implementation, they may wait indefinitely for the queue to have enough capacity to insert before completing the enqueue operation. This mode is common in most producer-consumer queues and is typically used for message passing and distributed work tasks.
   - **DROP_OLD**: In drop-old mode, producers continue to write data even if the data is not yet consumed. As a result, producers no longer need to wait for consumers to make further progress and are instead only blocked by producers with ongoing enqueue operations. As this mode is considered “lossy”, its intended use is for software profiling, tracing and/or debugging, as well as logging, in which producers should be able to overwrite unconsumed data whenever the buffer gets full.
-
----
 
 ## Usage
 
@@ -104,8 +99,6 @@ void clear() noexcept;
 Clears the queue, resetting its state.
 **Remark:** This method should only be used in a single-threaded context while the queue is not in active use. In any other case, behavior is undefined and is likely to cause memory-related errors.
 
----
-
 ## Example
 
 A minimal example demonstrating the usage of `queues::BlockBoundedQueue`. For a multi-producer multi-consumer example, please refer to the benchmark runner source code.
@@ -125,8 +118,6 @@ int main() {
     }
 }
 ```
-
----
 
 ## Benchmarks
 
@@ -152,7 +143,6 @@ Excerpts from the benchmark results taken from the thesis paper. For detailed in
 #### Multi-Producer Multi-Consumer (SPMC)
 ![Single-Producer Multi-Consumer benchmarks](docs/figures/spmc.png)
 
----
 ## TODO
 
 - [ ] Add more queues to the benchmark test suite.
@@ -161,8 +151,6 @@ Excerpts from the benchmark results taken from the thesis paper. For detailed in
 - [ ] Implement an iterator for the queue, which would allow for content inspection without dequeueing and enqueueing all elements again.
 - [ ] Support for Microsoft Visual C++ (MSVC) compiler.
 - [ ] Test on Windows and MacOS.
-
----
 
 ## About
 
